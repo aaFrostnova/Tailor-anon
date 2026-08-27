@@ -15,8 +15,8 @@ class PWL:
     def add_to_z3(self, x_var, name):
         """Return (y_var, constraints) encoding y_var == PWL(x_var) exactly.
         One boolean per segment; exactly one active; within the active segment y is the
-        linear interpolant. x_var is assumed already bounded to [xs[0], xs[-1]] by the caller
-        (or clamped here via the end segments)."""
+        linear interpolant. The caller MUST bound x_var to [xs[0], xs[-1]] before adding these
+        constraints; an out-of-range x_var makes the constraint set unsat."""
         y = z3.Real(f"y_{name}")
         segs = [z3.Bool(f"seg_{name}_{i}") for i in range(len(self.xs) - 1)]
         cons = [z3.PbEq([(b, 1) for b in segs], 1)]  # exactly one segment active

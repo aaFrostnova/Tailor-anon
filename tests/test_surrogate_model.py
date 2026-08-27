@@ -1,5 +1,6 @@
-import sys
-sys.path.insert(0, "/work/pi_shiqingma_umass_edu/mingzheli/cryptographic_fingerprint/scripts/defense")
+import os, sys
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(REPO, "scripts/defense"))
 import z3
 from surrogate_model import PWL
 
