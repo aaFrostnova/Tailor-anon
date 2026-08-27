@@ -7,7 +7,6 @@ Regen/rinse/rot/crop bit-acc for VINE/TM come from frag_suite (n=20) + memory (r
 """
 import json, sys, argparse
 from z3 import (Optimize, Bool, Int, Real, If, Or, And, Not, Implies, Sum, BoolVal, sat, is_true)
-from surrogate_model import PWL
 CF="/work/pi_shiqingma_umass_edu/mingzheli/cryptographic_fingerprint"
 D=json.load(open(CF+"/results/defense/smt_inputs.json"))              # solo: VINE alpha-sweep + per-frag solo PSNR + timing
 DC=json.load(open(CF+"/results/defense/smt_inputs_composite.json"))    # composite PSNR stack anchors
@@ -302,6 +301,7 @@ def _check_resolution(res, attacks=()):
 def build(min_psnr,max_ms,attacks,min_ba,allow_resync,allow_nested,min_bits=0,resolution=512,
           enable_order=False,continuous_strength=False,surrogate=None):
     _check_resolution(resolution, attacks)
+    surrogate_mode = (enable_order or continuous_strength) and surrogate is not None
     opt=Optimize()
     use={f:Bool(f) for f in FR}; resync=Bool("resync"); nested=Bool("nested")
     a_lvl=Int("alpha_lvl")                                   # 0->0.5, 1->0.7, 2->1.0 (VINE only)
@@ -323,16 +323,21 @@ def build(min_psnr,max_ms,attacks,min_ba,allow_resync,allow_nested,min_bits=0,re
     time=Sum([If(use[f],cost_ms(f),0.0) for f in FR]) + If(resync,FE_MS['resync'],0.0) + If(nested,FE_MS['nested'],0.0)
     opt.add(time<=max_ms)
     a_ge07 = a_lvl>=2
-    for a in attacks:
-        opts=[]
-        for f in list(F):
-            if f=="VINE" and a in SWEPT and a!="crop75":
-                # alpha-specific measured bit-acc for swept signal attacks
-                ok=Or(*[And(a_lvl==i, BoolVal(ALPHA[str(ALV[i])][a]>=min_ba)) for i in range(4)])
-                opts.append(And(use["VINE"], ok))
-            else:
-                opts.append(And(use[f], frag_defends(f,a,min_ba,a_ge07,resync,nested)))
-        opt.add(Or(*opts))
+    if not surrogate_mode:
+        # discrete per-attack min_ba feasibility from the measured tables. Skipped in surrogate_mode:
+        # the necessity experiment compares z3 against a grid enumerator that evaluates ONLY the
+        # surrogate, so z3's feasible set must be driven by the surrogate alone (added below via
+        # add_strength_order), not the real measured tables AND the surrogate at once.
+        for a in attacks:
+            opts=[]
+            for f in list(F):
+                if f=="VINE" and a in SWEPT and a!="crop75":
+                    # alpha-specific measured bit-acc for swept signal attacks
+                    ok=Or(*[And(a_lvl==i, BoolVal(ALPHA[str(ALV[i])][a]>=min_ba)) for i in range(4)])
+                    opts.append(And(use["VINE"], ok))
+                else:
+                    opts.append(And(use[f], frag_defends(f,a,min_ba,a_ge07,resync,nested)))
+            opt.add(Or(*opts))
     # CAPACITY constraint: need >= min_bits robust ID bits under each MEASURED in-scope attack
     # (some chosen fragment must carry >= min_bits reliable bits). Unmeasured attacks are skipped (warned in caller).
     if min_bits>0:
@@ -352,7 +357,7 @@ def build(min_psnr,max_ms,attacks,min_ba,allow_resync,allow_nested,min_bits=0,re
                 else:
                     capopts.append(And(use[f], BoolVal(c>=min_bits)))
             opt.add(Or(*capopts))
-    if (enable_order or continuous_strength) and surrogate is not None:
+    if surrogate_mode:
         s_vars, p_vars, psnr_expr = add_strength_order(opt, use, attacks, surrogate, min_ba, enable_order)
         psnr = psnr_expr          # override the discrete-PSNR expression with the surrogate PSNR
         opt._svars = s_vars; opt._pvars = p_vars    # expose for callers/tests
@@ -360,6 +365,7 @@ def build(min_psnr,max_ms,attacks,min_ba,allow_resync,allow_nested,min_bits=0,re
 
 def add_strength_order(opt, u, sel_attacks, surrogate, min_ba, order):
     import z3
+    assert set(surrogate.fragments) <= set(u.keys()), "surrogate fragments must be a subset of the solver's fragment vars"
     FRs = surrogate.fragments
     s = {f: z3.Real(f"s_{f}") for f in FRs}
     for f in FRs:
@@ -386,12 +392,12 @@ def add_strength_order(opt, u, sel_attacks, surrogate, min_ba, order):
         if a not in surrogate.attacks: continue
         for f in FRs:
             bexpr,bc = surrogate.base(f,a).add_to_z3(s[f], f"base_{f}_{a}")
-            for c in bc: opt.add(c)
+            for c in bc: opt.add(z3.Implies(u[f], c))          # domain constraint only meaningful when f selected (input is s[f])
             drops=[]
             for g in FRs:
                 if g==f: continue
                 dexpr,dc = surrogate.delta(g,f,a).add_to_z3(s[g], f"del_{g}_{f}_{a}")
-                for c in dc: opt.add(c)
+                for c in dc: opt.add(z3.Implies(u[g], c))      # input is s[g], not s[f] -> gate on u[g]
                 after = z3.And(p[(f,g)], u[g]) if order else z3.And(u[g], (FRs.index(g)>FRs.index(f)))
                 drops.append(z3.If(after, dexpr, z3.RealVal(0)))
             opt.add(z3.Implies(u[f], bexpr - z3.Sum(drops) >= min_ba))
@@ -399,13 +405,13 @@ def add_strength_order(opt, u, sel_attacks, surrogate, min_ba, order):
     dterms=[]
     for f in FRs:
         dexpr,dc = surrogate.d(f).add_to_z3(s[f], f"d_{f}")
-        for c in dc: opt.add(c)
+        for c in dc: opt.add(z3.Implies(u[f], c))              # input is s[f] -> gate on u[f]
         dterms.append(z3.If(u[f], dexpr, z3.RealVal(0)))
     for i,f in enumerate(FRs):
         for g in FRs[i+1:]:
             ssum = z3.Real(f"ssum_{f}_{g}"); opt.add(ssum == s[f]+s[g])
             eexpr,ec = surrogate.e(f,g).add_to_z3(ssum, f"e_{f}_{g}")
-            for c in ec: opt.add(c)
+            for c in ec: opt.add(z3.Implies(z3.And(u[f], u[g]), c))   # input is s[f]+s[g] -> gate on both selected
             dterms.append(z3.If(z3.And(u[f],u[g]), eexpr, z3.RealVal(0)))
     D = z3.Real("D_total"); opt.add(D == z3.Sum(dterms))
     psnr = z3.Real("psnr_surro"); opt.add(psnr == -D)     # monotone proxy; real dB mapping applied post-hoc
