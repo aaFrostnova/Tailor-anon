@@ -39,3 +39,18 @@ def test_synthetic_surrogate_shapes_and_monotone():
     # round-trip
     sg2 = Surrogate.from_dict(sg.to_dict())
     assert abs(sg2.base("VINE", a).eval(hi) - base.eval(hi)) < 1e-9
+
+
+def test_pwl_add_to_z3_clamps_out_of_range():
+    import z3, numpy as np
+    from surrogate_model import PWL
+    p = PWL([0.0, 1.0, 2.0], [3.0, 10.0, 12.0])
+    def solve_y(xval):
+        x = z3.Real("x"); y, cons = p.add_to_z3(x, "c")
+        s = z3.Solver(); s.add(cons); s.add(x == xval)
+        assert s.check() == z3.sat
+        return float(s.model().eval(y).as_fraction())
+    for xv in [-5.0, -0.01, 2.01, 9.0]:          # outside [0,2] -> must clamp to endpoint, like np.interp
+        assert abs(solve_y(xv) - float(np.interp(xv, p.xs, p.ys))) < 1e-6
+    for xv in [0.0, 0.5, 1.0, 1.7, 2.0]:         # in-range still exact
+        assert abs(solve_y(xv) - p.eval(xv)) < 1e-6

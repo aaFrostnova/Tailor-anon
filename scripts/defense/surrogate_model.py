@@ -16,13 +16,19 @@ class PWL:
         return float(np.interp(x, self.xs, self.ys))  # np.interp clamps to end values
 
     def add_to_z3(self, x_var, name):
-        """Return (y_var, constraints) encoding y_var == PWL(x_var) exactly.
-        One boolean per segment; exactly one active; within the active segment y is the
-        linear interpolant. The caller MUST bound x_var to [xs[0], xs[-1]] before adding these
-        constraints; an out-of-range x_var makes the constraint set unsat."""
+        """Return (y_var, constraints) encoding y_var == PWL(x_var), CLAMPED outside
+        [xs[0], xs[-1]] to the endpoint y-values -- matching np.interp's behavior in .eval()
+        (an out-of-range x_var is no longer unsat). One boolean per interior segment plus a
+        `low` and `high` boundary case; exactly one of {low, seg_0 .. seg_{n-2}, high} is
+        active. Boundary overlap at a knot (e.g. x_var == xs[0]) is fine -- more than one case
+        yields the same y there, z3 just picks one."""
         y = z3.Real(f"y_{name}")
         segs = [z3.Bool(f"seg_{name}_{i}") for i in range(len(self.xs) - 1)]
-        cons = [z3.PbEq([(b, 1) for b in segs], 1)]  # exactly one segment active
+        low = z3.Bool(f"low_{name}")
+        high = z3.Bool(f"high_{name}")
+        cons = [z3.PbEq([(b, 1) for b in ([low] + segs + [high])], 1)]  # exactly one case active
+        cons.append(z3.Implies(low, z3.And(x_var <= self.xs[0], y == self.ys[0])))
+        cons.append(z3.Implies(high, z3.And(x_var >= self.xs[-1], y == self.ys[-1])))
         for i, b in enumerate(segs):
             x0, x1, y0, y1 = self.xs[i], self.xs[i+1], self.ys[i], self.ys[i+1]
             slope = (y1 - y0) / (x1 - x0)
@@ -76,5 +82,5 @@ def synthetic_surrogate(fragments=("VINE","TrustMark","VideoSeal"), attacks=tupl
     for i in range(len(fragments)):
         for j in range(i+1,len(fragments)):
             p=tuple(sorted((fragments[i],fragments[j])))
-            xs=[0.6,1.2,1.8,2.4,3.0]; e[p]=PWL(xs,[0.1*x for x in xs])   # 1-D in s_f+s_g
+            xs=[0.6,1.25,1.9,2.55,3.2]; e[p]=PWL(xs,[0.1*x for x in xs])   # 1-D in s_f+s_g; spans up to the max pairwise strength sum (TrustMark.hi+VideoSeal.hi=3.1)
     return Surrogate(fragments,attacks,ranges,base,delta,d,e)
