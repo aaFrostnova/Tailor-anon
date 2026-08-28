@@ -388,8 +388,13 @@ def add_strength_order(opt, u, sel_attacks, surrogate, min_ba, order):
     else:
         for (f,g) in p: opt.add(p[(f,g)] == False)                       # fixed canonical order
     # feasibility: base_f(s_f,a) - sum_g after f delta_{g->f}(s_g,a) >= min_ba
+    # Composite detection is BEST-PATH (max over fragments): a config survives attack a iff SOME
+    # selected fragment clears it, not iff EVERY selected fragment clears it. So the per-fragment
+    # feasibility clause is OR'd across fragments (at least one clears), not asserted independently
+    # per fragment (which wrongly required every selected fragment to survive every attack).
     for a in sel_attacks:
         if a not in surrogate.attacks: continue
+        clears = []
         for f in FRs:
             bexpr,bc = surrogate.base(f,a).add_to_z3(s[f], f"base_{f}_{a}")
             for c in bc: opt.add(z3.Implies(u[f], c))          # domain constraint only meaningful when f selected (input is s[f])
@@ -398,9 +403,10 @@ def add_strength_order(opt, u, sel_attacks, surrogate, min_ba, order):
                 if g==f: continue
                 dexpr,dc = surrogate.delta(g,f,a).add_to_z3(s[g], f"del_{g}_{f}_{a}")
                 for c in dc: opt.add(z3.Implies(u[g], c))      # input is s[g], not s[f] -> gate on u[g]
-                after = z3.And(p[(f,g)], u[g]) if order else z3.And(u[g], (FRs.index(g)>FRs.index(f)))
+                after = z3.And(p[(f,g)], u[g]) if order else z3.And(u[g], z3.BoolVal(FRs.index(g)>FRs.index(f)))
                 drops.append(z3.If(after, dexpr, z3.RealVal(0)))
-            opt.add(z3.Implies(u[f], bexpr - z3.Sum(drops) >= min_ba))
+            clears.append(z3.And(u[f], bexpr - z3.Sum(drops) >= min_ba))   # fragment f (if selected) clears attack a
+        opt.add(z3.Or(*clears))                                            # at least one selected fragment clears a
     # distortion D = sum_f d_f(s_f) + sum_{f<g} e_{fg}(s_f+s_g) [gated by co-select]; PSNR = -D proxy
     dterms=[]
     for f in FRs:
