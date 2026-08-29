@@ -413,19 +413,25 @@ def add_strength_order(opt, u, sel_attacks, surrogate, min_ba, order,
             c_on = surrogate.frontend(f"base_resync_{f}|{a}")
             if c_on is not None:
                 on_e, on_c = c_on.add_to_z3(s[f], f"baseresync_{f}_{a}"); cons = cons + on_c
-                # resync-OFF branch: prefer the control measured in the SAME run as the resync
-                # curve, so switching the front-end on or off is an apples-to-apples comparison on
-                # the same images instead of one that mixes measurement contexts. (Here the control
-                # and the main solo curve agree to <=0.023, so this changes no verdict -- but for
-                # VideoSeal that gap is the same size as the effect being decided, so the
-                # same-run control is the defensible branch to compare against.)
+                # A front-end enters as the EFFECT it was measured to have, not as a replacement
+                # level. The effect is (front-end on) minus (its control, measured in the same run
+                # with the front-end disabled), so the two sides of the switch are compared on the
+                # same images; adding that effect to the solo curve keeps the absolute level
+                # anchored to the same curve every other attack uses. Written as a replacement
+                # instead, turning the front-end OFF would silently move the fragment onto a
+                # different curve than the one the rest of the model -- and any enumerator
+                # comparing against it -- reads.
                 c_off = surrogate.frontend(f"raw_synced_noresync_{f}|{a}")
                 if c_off is not None:
                     off_e, off_c = c_off.add_to_z3(s[f], f"basenoresync_{f}_{a}"); cons = cons + off_c
+                    expr = expr + z3.If(resync, on_e - off_e, z3.RealVal(0))
                 else:
-                    off_e = expr
-                expr = z3.If(resync, on_e, off_e)   # outermost: resync wins if a cell had both
-        return expr, cons
+                    expr = z3.If(resync, on_e, expr)   # no control measured: fall back to replacement
+        # bit-accuracy is a rate: an effect large enough to push the sum past 1 is capped there, so
+        # a front-end can never make a fragment look better than a perfect decode.
+        capped = z3.Real(f"effba_{f}_{a}")
+        cons = cons + [capped == z3.If(expr > 1.0, z3.RealVal(1), expr)]
+        return capped, cons
 
     # NOTE for anyone comparing this solver against the grid enumerator in the necessity
     # experiment: that enumerator evaluates surrogate.base() directly and models no front-end
