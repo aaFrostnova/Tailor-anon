@@ -58,21 +58,28 @@ def test_capacity_curve_forces_a_stronger_config():
 
 
 def test_front_end_that_hurts_is_declined():
-    """resync must be OFF when its measured curve is worse than the same-run no-resync control."""
+    """resync must be OFF when the effect it was measured to have is negative.
+
+    A front-end contributes (its curve) minus (its same-run control), added to the solo curve, so
+    switching it off returns exactly the solo curve. Here the solo curve already clears the
+    threshold and the measured effect is negative, so enabling resync would break feasibility."""
     lo, hi = synthetic_surrogate().range("VideoSeal")
-    frontend = {"base_resync_VideoSeal|rot9": PWL([lo, hi], [0.55, 0.60]),           # worse
-                "raw_synced_noresync_VideoSeal|rot9": PWL([lo, hi], [0.90, 0.95])}   # control
-    r = _solve(_surrogate(frontend=frontend), ["rot9"], min_ba=0.85,
-               force=("VideoSeal",), forbid=("VINE", "TrustMark"))
-    assert r is not None, "the no-resync control clears 0.85, so this must be satisfiable"
-    assert r["resync"] is False, "solver enabled a front-end that its measured curve says hurts"
+    frontend = {"base_resync_VideoSeal|rot9": PWL([lo, hi], [0.55, 0.60]),           # front-end on
+                "raw_synced_noresync_VideoSeal|rot9": PWL([lo, hi], [0.90, 0.95])}   # its control
+    sg = _surrogate(frontend=frontend)
+    sg._base[("VideoSeal", "rot9")] = PWL([lo, hi], [0.95, 0.95])   # solo curve clears 0.85 alone
+    r = _solve(sg, ["rot9"], min_ba=0.85, force=("VideoSeal",), forbid=("VINE", "TrustMark"))
+    assert r is not None, "the solo curve clears 0.85, so this must be satisfiable"
+    assert r["resync"] is False, "solver enabled a front-end its measured effect says costs accuracy"
 
 
 def test_front_end_that_helps_is_enabled():
     """resync must be ON when only its curve clears the threshold."""
     lo, hi = synthetic_surrogate().range("TrustMark")
-    frontend = {"base_resync_TrustMark|rot9": PWL([lo, hi], [0.95, 0.99]),           # helps
-                "raw_synced_noresync_TrustMark|rot9": PWL([lo, hi], [0.50, 0.55])}   # control
-    r = _solve(_surrogate(frontend=frontend), ["rot9"], min_ba=0.90,
-               force=("TrustMark",), forbid=("VINE", "VideoSeal"))
-    assert r is not None and r["resync"] is True
+    frontend = {"base_resync_TrustMark|rot9": PWL([lo, hi], [0.99, 0.99]),           # front-end on
+                "raw_synced_noresync_TrustMark|rot9": PWL([lo, hi], [0.50, 0.50])}   # its control
+    sg = _surrogate(frontend=frontend)
+    sg._base[("TrustMark", "rot9")] = PWL([lo, hi], [0.50, 0.50])   # solo curve alone fails 0.90
+    r = _solve(sg, ["rot9"], min_ba=0.90, force=("TrustMark",), forbid=("VINE", "VideoSeal"))
+    assert r is not None and r["resync"] is True, \
+        "only the front-end's measured effect clears the threshold, so it must be enabled"

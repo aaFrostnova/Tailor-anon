@@ -319,7 +319,10 @@ def build(min_psnr,max_ms,attacks,min_ba,allow_resync,allow_nested,min_bits=0,re
     # base must EQUAL the min (tie it down): base >= each-or-not handled by maximizing psnr later
     pen=If(nfrag<=1, 0.0, If(nfrag==2, PEN2, If(nfrag==3, PEN3, PEN4)))   # MEASURED stacking penalty (~0.6dB/frag)
     psnr=base - pen - If(nested,NESTED_PEN,0.0)
-    opt.add(psnr>=min_psnr)
+    if not surrogate_mode:                 # in surrogate_mode the fidelity floor is stated once,
+        opt.add(psnr>=min_psnr)            # on the surrogate objective (see add_strength_order);
+                                           # binding the discrete expression as well would let a
+                                           # tighter floor select a worse continuous optimum.
     time=Sum([If(use[f],cost_ms(f),0.0) for f in FR]) + If(resync,FE_MS['resync'],0.0) + If(nested,FE_MS['nested'],0.0)
     opt.add(time<=max_ms)
     a_ge07 = a_lvl>=2
@@ -359,13 +362,14 @@ def build(min_psnr,max_ms,attacks,min_ba,allow_resync,allow_nested,min_bits=0,re
             opt.add(Or(*capopts))
     if surrogate_mode:
         s_vars, p_vars, psnr_expr = add_strength_order(opt, use, attacks, surrogate, min_ba, enable_order,
-                                               resync=resync, nested=nested, min_bits=min_bits)
+                                               resync=resync, nested=nested, min_bits=min_bits,
+                                               min_psnr=min_psnr)
         psnr = psnr_expr          # override the discrete-PSNR expression with the surrogate PSNR
         opt._svars = s_vars; opt._pvars = p_vars    # expose for callers/tests
     return opt,use,resync,nested,a_lvl,nfrag,psnr,time
 
 def add_strength_order(opt, u, sel_attacks, surrogate, min_ba, order,
-                       resync=None, nested=None, min_bits=0):
+                       resync=None, nested=None, min_bits=0, min_psnr=None):
     import z3
     assert set(surrogate.fragments) <= set(u.keys()), "surrogate fragments must be a subset of the solver's fragment vars"
     FRs = surrogate.fragments
@@ -394,6 +398,13 @@ def add_strength_order(opt, u, sel_attacks, surrogate, min_ba, order,
     # selected fragment clears it, not iff EVERY selected fragment clears it. So the per-fragment
     # feasibility clause is OR'd across fragments (at least one clears), not asserted independently
     # per fragment (which wrongly required every selected fragment to survive every attack).
+    # The PWL domain constraints below are added unconditionally rather than gated on selection.
+    # add_to_z3 clamps an out-of-range input to the endpoint value, so a fragment that is not
+    # selected (its strength pinned to 0, outside its native range) still yields a well-defined
+    # curve value instead of an unsatisfiable branch -- which is what the gating used to be for.
+    # Leaving them gated has a cost that is easy to miss: a gate that is false leaves its curve
+    # variable free, and a free real sitting inside an ite term is enough to make the optimizer
+    # report a suboptimal point as optimal.
     def eff_base(f, a):
         """Front-end-aware base curve for (f,a), as (z3 expr, domain constraints).
 
@@ -444,12 +455,12 @@ def add_strength_order(opt, u, sel_attacks, surrogate, min_ba, order,
         clears = []
         for f in FRs:
             bexpr,bc = eff_base(f, a)
-            for c in bc: opt.add(z3.Implies(u[f], c))          # domain constraint only meaningful when f selected (input is s[f])
+            for c in bc: opt.add(c)
             drops=[]
             for g in FRs:
                 if g==f: continue
                 dexpr,dc = surrogate.delta(g,f,a).add_to_z3(s[g], f"del_{g}_{f}_{a}")
-                for c in dc: opt.add(z3.Implies(u[g], c))      # input is s[g], not s[f] -> gate on u[g]
+                for c in dc: opt.add(c)
                 after = z3.And(p[(f,g)], u[g]) if order else z3.And(u[g], z3.BoolVal(FRs.index(g)>FRs.index(f)))
                 drops.append(z3.If(after, dexpr, z3.RealVal(0)))
             clears.append(z3.And(u[f], bexpr - z3.Sum(drops) >= min_ba))   # fragment f (if selected) clears attack a
@@ -458,13 +469,13 @@ def add_strength_order(opt, u, sel_attacks, surrogate, min_ba, order,
     dterms=[]
     for f in FRs:
         dexpr,dc = surrogate.d(f).add_to_z3(s[f], f"d_{f}")
-        for c in dc: opt.add(z3.Implies(u[f], c))              # input is s[f] -> gate on u[f]
+        for c in dc: opt.add(c)
         dterms.append(z3.If(u[f], dexpr, z3.RealVal(0)))
     for i,f in enumerate(FRs):
         for g in FRs[i+1:]:
             ssum = z3.Real(f"ssum_{f}_{g}"); opt.add(ssum == s[f]+s[g])
             eexpr,ec = surrogate.e(f,g).add_to_z3(ssum, f"e_{f}_{g}")
-            for c in ec: opt.add(z3.Implies(z3.And(u[f], u[g]), c))   # input is s[f]+s[g] -> gate on both selected
+            for c in ec: opt.add(c)
             dterms.append(z3.If(z3.And(u[f],u[g]), eexpr, z3.RealVal(0)))
     # nested-ring front-end: its distortion cost is a MEASURED function of VINE's strength
     # (it rises ~13x across the grid), not the single constant the discrete path uses.
@@ -472,10 +483,17 @@ def add_strength_order(opt, u, sel_attacks, surrogate, min_ba, order,
     if npc is not None and nested is not None and "VINE" in FRs:
         npe, npcons = npc.add_to_z3(s["VINE"], "nestpen")
         gate = z3.And(nested, u["VINE"])
-        for c in npcons: opt.add(z3.Implies(gate, c))
+        for c in npcons: opt.add(c)
         dterms.append(z3.If(gate, npe, z3.RealVal(0)))
     D = z3.Real("D_total"); opt.add(D == z3.Sum(dterms))
     psnr = z3.Real("psnr_surro"); opt.add(psnr == -D)     # monotone proxy; real dB mapping applied post-hoc
+
+    # The caller's fidelity floor is stated in dB, but the objective here is a distortion in MSE.
+    # Converting the floor instead of the objective keeps the constraint linear: PSNR >= q is
+    # exactly D <= 255^2 / 10^(q/10). Without this the floor would bind the discrete PSNR
+    # expression that surrogate_mode replaces, i.e. a quantity that is no longer the objective.
+    if min_psnr is not None and min_psnr > 0:
+        opt.add(D <= (255.0 ** 2) / (10.0 ** (float(min_psnr) / 10.0)))
 
     # CAPACITY, from the measured per-strength curves. Same best-path (OR) semantics as feasibility:
     # the same ID is repeated across fragments, so the best survivor carries it. Capacity is strongly
@@ -490,7 +508,7 @@ def add_strength_order(opt, u, sel_attacks, surrogate, min_ba, order,
                 cp = getattr(surrogate, "cap", lambda *_: None)(f, a)
                 if cp is not None:
                     ce, cc = cp.add_to_z3(s[f], f"cap_{f}_{a}")
-                    for c in cc: opt.add(z3.Implies(u[f], c))
+                    for c in cc: opt.add(c)
                     caps.append(z3.And(u[f], ce >= min_bits))
                 else:
                     # No measured curve for this cell (the strength sweep covers the in-process
