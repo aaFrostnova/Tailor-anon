@@ -340,8 +340,8 @@ def build(min_psnr,max_ms,attacks,min_ba,allow_resync,allow_nested,min_bits=0,re
             opt.add(Or(*opts))
     # CAPACITY constraint: need >= min_bits robust ID bits under each MEASURED in-scope attack
     # (some chosen fragment must carry >= min_bits reliable bits). Unmeasured attacks are skipped (warned in caller).
-    if min_bits>0:
-        for a in attacks:
+    if min_bits>0 and not surrogate_mode:      # surrogate_mode gets capacity from the measured
+        for a in attacks:                      # per-strength curves inside add_strength_order
             if a not in CAP["VINE"]: continue   # capacity unmeasured for this attack -> skip
             capopts=[]
             for f in list(F):
@@ -358,12 +358,14 @@ def build(min_psnr,max_ms,attacks,min_ba,allow_resync,allow_nested,min_bits=0,re
                     capopts.append(And(use[f], BoolVal(c>=min_bits)))
             opt.add(Or(*capopts))
     if surrogate_mode:
-        s_vars, p_vars, psnr_expr = add_strength_order(opt, use, attacks, surrogate, min_ba, enable_order)
+        s_vars, p_vars, psnr_expr = add_strength_order(opt, use, attacks, surrogate, min_ba, enable_order,
+                                               resync=resync, nested=nested, min_bits=min_bits)
         psnr = psnr_expr          # override the discrete-PSNR expression with the surrogate PSNR
         opt._svars = s_vars; opt._pvars = p_vars    # expose for callers/tests
     return opt,use,resync,nested,a_lvl,nfrag,psnr,time
 
-def add_strength_order(opt, u, sel_attacks, surrogate, min_ba, order):
+def add_strength_order(opt, u, sel_attacks, surrogate, min_ba, order,
+                       resync=None, nested=None, min_bits=0):
     import z3
     assert set(surrogate.fragments) <= set(u.keys()), "surrogate fragments must be a subset of the solver's fragment vars"
     FRs = surrogate.fragments
@@ -392,11 +394,50 @@ def add_strength_order(opt, u, sel_attacks, surrogate, min_ba, order):
     # selected fragment clears it, not iff EVERY selected fragment clears it. So the per-fragment
     # feasibility clause is OR'd across fragments (at least one clears), not asserted independently
     # per fragment (which wrongly required every selected fragment to survive every attack).
+    def eff_base(f, a):
+        """Front-end-aware base curve for (f,a), as (z3 expr, domain constraints).
+
+        The plain solo curve is the default; where a MEASURED front-end curve exists for this
+        (fragment, attack) the corresponding front-end boolean switches the expression to it.
+        Because those curves are measured rather than assumed, a front-end that HURTS a fragment
+        is represented as such -- resync lowers VideoSeal's rotation accuracy while raising
+        TrustMark's -- so the solver can decline a front-end instead of being forced to treat
+        every front-end as a pure gain."""
+        expr, cons = surrogate.base(f, a).add_to_z3(s[f], f"base_{f}_{a}")
+        if nested is not None:
+            c = surrogate.frontend(f"base_nested_{f}|{a}")
+            if c is not None:
+                ne, nc = c.add_to_z3(s[f], f"basenest_{f}_{a}"); cons = cons + nc
+                expr = z3.If(nested, ne, expr)
+        if resync is not None:
+            c_on = surrogate.frontend(f"base_resync_{f}|{a}")
+            if c_on is not None:
+                on_e, on_c = c_on.add_to_z3(s[f], f"baseresync_{f}_{a}"); cons = cons + on_c
+                # resync-OFF branch: prefer the control measured in the SAME run as the resync
+                # curve, so switching the front-end on or off is an apples-to-apples comparison on
+                # the same images instead of one that mixes measurement contexts. (Here the control
+                # and the main solo curve agree to <=0.023, so this changes no verdict -- but for
+                # VideoSeal that gap is the same size as the effect being decided, so the
+                # same-run control is the defensible branch to compare against.)
+                c_off = surrogate.frontend(f"raw_synced_noresync_{f}|{a}")
+                if c_off is not None:
+                    off_e, off_c = c_off.add_to_z3(s[f], f"basenoresync_{f}_{a}"); cons = cons + off_c
+                else:
+                    off_e = expr
+                expr = z3.If(resync, on_e, off_e)   # outermost: resync wins if a cell had both
+        return expr, cons
+
+    # NOTE for anyone comparing this solver against the grid enumerator in the necessity
+    # experiment: that enumerator evaluates surrogate.base() directly and models no front-end
+    # variables, so the two only solve the SAME problem when the front-ends are disabled. Run
+    # necessity scenarios with allow_resync=False, allow_nested=False (which forces both booleans
+    # false, collapsing eff_base to the plain curve) or the z3-vs-grid comparison is not like-for-like.
+
     for a in sel_attacks:
         if a not in surrogate.attacks: continue
         clears = []
         for f in FRs:
-            bexpr,bc = surrogate.base(f,a).add_to_z3(s[f], f"base_{f}_{a}")
+            bexpr,bc = eff_base(f, a)
             for c in bc: opt.add(z3.Implies(u[f], c))          # domain constraint only meaningful when f selected (input is s[f])
             drops=[]
             for g in FRs:
@@ -419,8 +460,42 @@ def add_strength_order(opt, u, sel_attacks, surrogate, min_ba, order):
             eexpr,ec = surrogate.e(f,g).add_to_z3(ssum, f"e_{f}_{g}")
             for c in ec: opt.add(z3.Implies(z3.And(u[f], u[g]), c))   # input is s[f]+s[g] -> gate on both selected
             dterms.append(z3.If(z3.And(u[f],u[g]), eexpr, z3.RealVal(0)))
+    # nested-ring front-end: its distortion cost is a MEASURED function of VINE's strength
+    # (it rises ~13x across the grid), not the single constant the discrete path uses.
+    npc = surrogate.frontend("nested_penalty")
+    if npc is not None and nested is not None and "VINE" in FRs:
+        npe, npcons = npc.add_to_z3(s["VINE"], "nestpen")
+        gate = z3.And(nested, u["VINE"])
+        for c in npcons: opt.add(z3.Implies(gate, c))
+        dterms.append(z3.If(gate, npe, z3.RealVal(0)))
     D = z3.Real("D_total"); opt.add(D == z3.Sum(dterms))
     psnr = z3.Real("psnr_surro"); opt.add(psnr == -D)     # monotone proxy; real dB mapping applied post-hoc
+
+    # CAPACITY, from the measured per-strength curves. Same best-path (OR) semantics as feasibility:
+    # the same ID is repeated across fragments, so the best survivor carries it. Capacity is strongly
+    # strength-dependent (a cell ranges from ~0 to ~96 bits across one fragment's grid), which a single
+    # constant per (fragment, attack) cannot express. Front-end capacity recovery is NOT measured, so
+    # these are the plain-fragment curves: with a front-end enabled this understates capacity, which is
+    # the safe direction (it can only reject a config that would have passed, never admit one that fails).
+    if min_bits > 0:
+        for a in sel_attacks:
+            caps = []
+            for f in FRs:
+                cp = getattr(surrogate, "cap", lambda *_: None)(f, a)
+                if cp is not None:
+                    ce, cc = cp.add_to_z3(s[f], f"cap_{f}_{a}")
+                    for c in cc: opt.add(z3.Implies(u[f], c))
+                    caps.append(z3.And(u[f], ce >= min_bits))
+                else:
+                    # No measured curve for this cell (the strength sweep covers the in-process
+                    # family; the diffusion family was measured at reference strengths only), so
+                    # fall back to the measured constant. Capacity therefore stays constrained on
+                    # every attack -- strength-resolved where that was measured, flat elsewhere --
+                    # rather than silently dropping out on the attacks that lack a curve.
+                    const = CAP.get(f, {}).get(a)
+                    if const is not None:
+                        caps.append(z3.And(u[f], z3.BoolVal(float(const) >= min_bits)))
+            if caps: opt.add(z3.Or(*caps))
     return s, p, psnr
 
 def report(tag,opt,use,resync,nested,a_lvl,psnr,time,attacks,min_ba):

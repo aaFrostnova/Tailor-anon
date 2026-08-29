@@ -37,21 +37,32 @@ class PWL:
         return y, cons
 
 class Surrogate:
-    def __init__(self, fragments, attacks, ranges, base, delta, d, e):
+    def __init__(self, fragments, attacks, ranges, base, delta, d, e, cap=None, frontend=None):
         self.fragments=list(fragments); self.attacks=list(attacks); self._ranges=dict(ranges)
         self._base=base; self._delta=delta; self._d=d; self._e=e   # dict-keyed PWLs
+        # OPTIONAL measured extras (absent in older tables, so every accessor returns None instead
+        # of raising -- callers must treat None as "not modelled" rather than "zero"):
+        #   cap[(f,a)]      reliable-bit capacity (bits) as a PWL in f's native strength
+        #   frontend[key]   front-end curves, e.g. "nested_penalty" (MSE vs s_VINE),
+        #                   "base_nested_VINE|crop75", "base_resync_TrustMark|rot9"
+        self._cap=dict(cap or {}); self._frontend=dict(frontend or {})
     def range(self,f): return self._ranges[f]
     def base(self,f,a): return self._base[(f,a)]
     def delta(self,g,f,a): return self._delta[(g,f,a)]
     def d(self,f): return self._d[f]
     def e(self,f,g): return self._e[tuple(sorted((f,g)))]
+    def cap(self,f,a): return self._cap.get((f,a))          # None when not measured
+    def has_cap(self): return bool(self._cap)
+    def frontend(self,key): return self._frontend.get(key)  # None when not measured
     def to_dict(self):
         pk=lambda p:{"xs":p.xs,"ys":p.ys}
         return {"fragments":self.fragments,"attacks":self.attacks,"ranges":self._ranges,
                 "base":{f"{f}|{a}":pk(self._base[(f,a)]) for (f,a) in self._base},
                 "delta":{f"{g}|{f}|{a}":pk(self._delta[(g,f,a)]) for (g,f,a) in self._delta},
                 "d":{f:pk(self._d[f]) for f in self._d},
-                "e":{f"{p[0]}|{p[1]}":pk(self._e[p]) for p in self._e}}
+                "e":{f"{p[0]}|{p[1]}":pk(self._e[p]) for p in self._e},
+                **({"cap":{f"{f}|{a}":pk(self._cap[(f,a)]) for (f,a) in self._cap}} if self._cap else {}),
+                **({"frontend":{k:pk(v) for k,v in self._frontend.items()}} if self._frontend else {})}
     @staticmethod
     def from_dict(dd):
         mk=lambda o:PWL(o["xs"],o["ys"])
@@ -59,7 +70,13 @@ class Surrogate:
         delta={(k.split("|")[0],k.split("|")[1],k.split("|")[2]):mk(v) for k,v in dd["delta"].items()}
         d={k:mk(v) for k,v in dd["d"].items()}
         e={tuple(k.split("|")):mk(v) for k,v in dd["e"].items()}
-        return Surrogate(dd["fragments"],dd["attacks"],dd["ranges"],base,delta,d,e)
+        # optional blocks; entries without {xs,ys} (e.g. free-form meta) are skipped, not fatal
+        cap={tuple(k.split("|")):mk(v) for k,v in (dd.get("cap") or {}).items()
+             if isinstance(v,dict) and "xs" in v}
+        frontend={k:mk(v) for k,v in (dd.get("frontend") or {}).items()
+                  if isinstance(v,dict) and "xs" in v}
+        return Surrogate(dd["fragments"],dd["attacks"],dd["ranges"],base,delta,d,e,
+                         cap=cap, frontend=frontend)
 
 def synthetic_surrogate(fragments=("VINE","TrustMark","VideoSeal"), attacks=tuple(PHASE1_ATTACKS)):
     import numpy as np
