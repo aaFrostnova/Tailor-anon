@@ -42,25 +42,29 @@ def test_geometry_identical_through_both_entry_points(name):
     assert np.array_equal(np.asarray(direct), np.asarray(viaapi)), f"{name} differs between paths"
 
 
-def test_crop_fraction_is_a_side_not_an_area():
-    """crop75 keeps 75% of each SIDE. Reading it as an area is the drift that caused the divergence,
-    so the convention is asserted rather than left to a comment."""
+def test_crop_fraction_is_an_area_not_a_side():
+    """crop75 keeps 75% of the AREA, so the side is sqrt(0.75). The alternative reading -- 0.75 per
+    side, i.e. 56% of the area -- is a materially harsher attack, and the two conventions coexisting
+    unnoticed is what made the surrogate and the matrix disagree. The convention is asserted here so a
+    future change has to be deliberate."""
     im = _img(n=100)
     W, H = im.size
-    kept = A.center_crop_resize(im, 0.75)
+    kept = A.center_crop_area(im, 0.75)
     assert kept.size == (W, H)                       # canvas restored
-    # the crop box is 75 of 100 pixels per side => 56.25% of the area, not 75%
-    box_side = int(round(W * 0.75))
-    assert box_side == 75
+    assert int(W * 0.75 ** 0.5) == 86                # side is 86 of 100, not 75
+    assert A.GEO["crop75"] is not None
+    assert np.array_equal(np.asarray(A.GEO["crop75"](im)), np.asarray(kept))
 
 
-def test_rotation_leaves_no_black_corners():
-    """The reported rotation reflect-pads. A default-fill rotation is a different attack: it hands the
-    decoder a strong visual cue at the corners, which is exactly where the geometric front-end looks."""
+def test_rotation_uses_the_default_fill():
+    """GEO['rot9'] rotates in place and leaves the corners black. That is lost content, but it is also
+    a localisation cue a corner-predicting front-end can exploit, so numbers measured under it are the
+    easier of the two conventions and must not be silently swapped for the reflection-padded variant."""
     im = Image.fromarray(np.full((128, 128, 3), 200, dtype=np.uint8))
-    rot = A.rotate_reflect(im, 9.0)
-    a = np.asarray(rot, np.float32)
-    assert (a.sum(2) < 6).mean() == 0.0, "reflect-padded rotation must not produce black pixels"
+    black = (np.asarray(A.GEO["rot9"](im), np.float32).sum(2) < 6).mean()
+    assert black > 0.01, "the adopted rotation must leave black corners"
+    refl = (np.asarray(A.rotate_reflect(im, 9.0), np.float32).sum(2) < 6).mean()
+    assert refl == 0.0, "the reflection-padded variant is retained for the convention ablation"
 
 
 def test_signal_parameters_are_declared_once():

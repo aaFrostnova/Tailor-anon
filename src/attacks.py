@@ -16,15 +16,43 @@ import numpy as np
 from PIL import Image
 
 # ---------------------------------------------------------------- geometry (pure PIL, no deps)
-def center_crop_resize(img, frac):
-    """Keep a centred `frac` of each SIDE and resize back -- so frac=0.75 keeps 56% of the area."""
-    W, H = img.size; cw, ch = int(round(W * frac)), int(round(H * frac))
+# CONVENTION. Two conventions were in use and had to be reconciled; the one adopted here is the
+# AREA-fraction crop and the default-fill rotation. Both are stated explicitly because the alternative
+# reading of each name denotes a materially different attack, and the earlier divergence between the
+# measurement campaigns and the evaluation harness was exactly this ambiguity going unnoticed.
+def center_crop_area(img, area_frac):
+    """Keep a centred `area_frac` of the AREA and resize back to the original canvas.
+
+    The side length is therefore sqrt(area_frac): "crop75" keeps three quarters of the picture, not
+    three quarters of each edge. Reading the same number as a side fraction gives a substantially
+    harsher attack (0.75 per side is 56% of the area), which is the discrepancy that previously made
+    the surrogate and the reported matrix disagree about what "crop75" meant.
+    """
+    W, H = img.size; s = area_frac ** 0.5
+    cw, ch = int(W * s), int(H * s)
     l, t = (W - cw) // 2, (H - ch) // 2
     return img.crop((l, t, l + cw, t + ch)).resize((W, H), Image.BICUBIC)
 
+# kept under the old name so callers that mean "a fraction of each side" cannot silently get the other
+def center_crop_resize(img, frac):
+    """Deprecated alias. `frac` is interpreted as an AREA fraction, matching center_crop_area."""
+    return center_crop_area(img, frac)
+
+def rotate_fill(img, deg):
+    """Rotate in place with the default fill, leaving the corners black.
+
+    Note for interpretation: the black corners are lost content, but they are also a strong
+    localisation cue, and a decoder with a geometric front-end can use them to recover the transform.
+    A reflection-padded rotation destroys less of the image yet is harder to invert, because the
+    original frame's corners end up outside the returned view. Numbers measured under this operator
+    should be read as the easier of the two for a front-end that predicts corners.
+    """
+    W, H = img.size
+    return img.rotate(deg, resample=Image.BICUBIC, expand=False).resize((W, H), Image.BICUBIC)
+
 def rotate_reflect(img, deg):
-    """Rotate with reflection padding, then crop back: no black corners, and no content lost at the
-    border -- but note the original frame's corners end up outside the returned view."""
+    """Reflection-padded rotation. Retained for the ablation that contrasts the two conventions; it is
+    NOT what GEO['rot9'] applies."""
     W, H = img.size; arr = np.array(img); pad = max(W, H) // 2
     refl = np.pad(arr, ((pad, pad), (pad, pad), (0, 0)), mode="reflect")
     big = Image.fromarray(refl).rotate(deg, resample=Image.BICUBIC, expand=False)
@@ -36,14 +64,14 @@ def resize_down_up(img, mid):
     return img.resize((mid, mid), Image.BICUBIC).resize((W, H), Image.BICUBIC)
 
 def crop_then_jpeg(img, frac=0.75, quality=25):
-    out = center_crop_resize(img.convert("RGB"), frac)
+    out = center_crop_area(img.convert("RGB"), frac)          # same area convention as crop75
     buf = io.BytesIO(); out.save(buf, format="JPEG", quality=quality)
     return Image.open(io.BytesIO(buf.getvalue())).convert("RGB")
 
 GEO = {
-    "crop75": lambda im: center_crop_resize(im, 0.75),
-    "crop50": lambda im: center_crop_resize(im, 0.50),
-    "rot9":   lambda im: rotate_reflect(im, 9.0),
+    "crop75": lambda im: center_crop_area(im, 0.75),          # 75% of the AREA (side 0.866)
+    "crop50": lambda im: center_crop_area(im, 0.50),          # 50% of the AREA (side 0.707)
+    "rot9":   lambda im: rotate_fill(im, 9.0),                # default fill, corners go black
     "rs256":  lambda im: resize_down_up(im, 256),
     "hflip":  lambda im: im.transpose(Image.FLIP_LEFT_RIGHT),
     "crop_jpeg": crop_then_jpeg,
@@ -105,3 +133,64 @@ def attack_pil(name, img, dev="cuda", _vae_cache={}):
             except OSError: pass
         try: os.rmdir(d)
         except OSError: pass
+
+
+# ---------------------------------------------------------------- diffusion family (in-process)
+# The mild regeneration and its repeats. These were built independently in the harness and in each
+# regeneration campaign; the noise step in particular decides how destructive the attack is, so it is
+# declared once here.
+SD21_PATH = "/project/pi_shiqingma_umass_edu/mingzheli/model/stable-diffusion-2-1"
+REGEN_PARAMS = dict(noise_step=60, batch_size=1)
+RINSE_PASSES = {"regen": 1, "rinse2x": 2, "rinse4x": 4}
+_REGEN = {}
+
+def regen_attacker(dev="cuda", sd_path=SD21_PATH):
+    """The single mild-regeneration attacker. Loaded lazily: a campaign that touches no diffusion
+    attack must not pay for Stable Diffusion."""
+    if "att" not in _REGEN:
+        import torch
+        from regen_pipe import ReSDPipeline
+        from wmattacker import DiffWMAttacker
+        from diffusers import DPMSolverMultistepScheduler
+        pipe = ReSDPipeline.from_pretrained(sd_path, torch_dtype=torch.float16)
+        pipe.scheduler = DPMSolverMultistepScheduler.from_config(pipe.scheduler.config)
+        pipe.set_progress_bar_config(disable=True)
+        _REGEN["att"] = DiffWMAttacker(pipe.to(dev), **REGEN_PARAMS)
+    return _REGEN["att"]
+
+def regen_pil(img, passes=1, dev="cuda", workdir=None):
+    """Apply the regeneration `passes` times in sequence -- the repo's rinse definition."""
+    import tempfile, shutil
+    att = regen_attacker(dev)
+    d = workdir or tempfile.mkdtemp()
+    try:
+        cur = os.path.join(d, "r_in.png"); img.convert("RGB").save(cur)
+        for k in range(passes):
+            nxt = os.path.join(d, f"r_{k}.png"); att.attack([cur], [nxt]); cur = nxt
+        return Image.open(cur).convert("RGB")
+    finally:
+        if workdir is None:
+            shutil.rmtree(d, ignore_errors=True)
+
+# ---------------------------------------------------------------- cross-environment attacks
+# CtrlRegen and UnMarker need their own conda environments, so they cannot be called in-process.
+# What CAN be centralised is how they are invoked, which is what drifted between run scripts.
+CROSS_ENV = {
+    "ctrlregen": {"env": "/project/pi_shiqingma_umass_edu/mingzheli/.conda/envs/ctrlregen/bin/python",
+                  "script": "scripts/attack/ctrlregen_batch.py",
+                  "default_step": 0.7, "sweep_steps": [0.1, 0.3, 0.5, 0.7, 0.9]},
+    "unmarker":  {"env": "/project/pi_shiqingma_umass_edu/mingzheli/.conda/envs/unmarker/bin/python",
+                  "script": "scripts/attack/unmarker_batch.py",
+                  "config": "attack_configs/Vine.yaml"},
+}
+
+# The attacks a campaign may run in-process. Anything outside this set has to be staged through
+# CROSS_ENV and is reported as such rather than silently skipped.
+IN_PROCESS = set(GEO) | set(SIGNAL_PARAMS) | {"vae_b", "vae_c"} | set(RINSE_PASSES) | {"clean"}
+
+def attack_pil_any(name, img, dev="cuda"):
+    """Dispatch over every in-process attack, including the diffusion family."""
+    name = ALIASES.get(name, name)
+    if name in RINSE_PASSES:
+        return regen_pil(img, passes=RINSE_PASSES[name], dev=dev)
+    return attack_pil(name, img, dev=dev)
