@@ -177,6 +177,42 @@ def frag_defends(f, a, thr, alpha_ge07, resync, nested):
 def solo_psnr_expr(f, a_lvl):
     if f=="VINE": return If(a_lvl==0,ALPHA["0.3"]["psnr"],If(a_lvl==1,ALPHA["0.5"]["psnr"],If(a_lvl==2,ALPHA["0.7"]["psnr"],ALPHA["1.0"]["psnr"])))
     return PSNR_SOLO.get(f,40.0)
+def beta_from_fpr(alpha, n_tx=100, t_corr=10, k_data=37):
+    """The bit accuracy a request's false-positive budget actually demands.
+
+    beta was previously a free knob, which left the feasibility rule unanchored: 0.75 corresponds to
+    neither test the deployment runs. It is derived here from the requested budget alpha, following
+    what the decoder actually does. Acceptance is the disjunction of
+
+      identity  -- BCH(n, k, t) decodes and reproduces the expected payload, which needs at most t bit
+                   errors, i.e. per-image accuracy >= (n - t)/n, and false-accepts at a fixed 2^-k;
+      presence  -- accuracy >= tau, where under H0 the matches are Binomial(n, 1/2), so a budget b is
+                   spent at tau(b) = (ppf(1 - b, n, 1/2) + 1)/n.
+
+    Since the deployment accepts on the disjunction, the two budgets add. The identity test's cost is
+    fixed and cannot be tuned, so it is charged first and the presence test spends the remainder:
+
+        alpha <  2^-k : not even the identity test fits, and no configuration can meet the request;
+        alpha >= 2^-k : identity is on, presence gets alpha - 2^-k, and beta is whichever of the two
+                        thresholds is cheaper -- min((n-t)/n, tau(alpha - 2^-k)).
+
+    Loosening alpha therefore lowers beta continuously through the presence threshold; tightening it
+    raises beta until the presence test is priced out, at which point beta stops at the code's
+    correction limit, because past that it is the code and not the threshold that bounds the error.
+    """
+    from scipy.stats import binom
+    beta_id = (n_tx - t_corr) / n_tx
+    fpr_id = 2.0 ** (-k_data)
+    if alpha < fpr_id:
+        return 1.0                                        # unattainable: even the code alone overspends
+    rest = alpha - fpr_id
+    if rest <= 0.0:
+        return float(beta_id)                             # identity alone exactly spends the budget
+    q = binom.ppf(1.0 - rest, n_tx, 0.5)
+    tau = (q + 1.0) / n_tx if q < n_tx else None
+    return float(beta_id if tau is None else min(beta_id, tau))
+
+
 def cost_ms(f):
     return D["fragments"][f]["embed_ms"]+D["fragments"][f]["decode_ms"]
 
@@ -368,6 +404,60 @@ def build(min_psnr,max_ms,attacks,min_ba,allow_resync,allow_nested,min_bits=0,re
         opt._svars = s_vars; opt._pvars = p_vars    # expose for callers/tests
     return opt,use,resync,nested,a_lvl,nfrag,psnr,time
 
+def solve_exact(scen, eps=1e-9, max_rounds=32, **build_kw):
+    """Solve to the CERTIFIED optimum, returning (value, rounds, certified).
+
+    z3's `Optimize.maximize` is not complete on this encoding. On the measured surrogate it returns a
+    satisfying but sub-optimal model, and it does so non-deterministically: repeated identical calls
+    disagree by as much as 2 dB. Trusting it breaks the property the method rests on -- that the
+    returned configuration is the best one meeting the request -- and it also understates the solver
+    against a grid baseline, because a grid that lands on a better point then appears to beat an
+    "exact" optimum.
+
+    `check` itself is sound, so the optimizer is used only to propose a candidate, which is then
+    certified: a fresh instance is asked whether any strictly better objective is satisfiable. Unsat
+    proves optimality; sat yields a better candidate and the query repeats. Each round improves the
+    objective by more than eps, and the objective is bounded, so this terminates -- in practice after
+    zero or one extra round.
+
+    Returns (None, rounds, True) when the request itself is unsatisfiable.
+    """
+    import z3
+    o, u, rs, ns, al, nf, ps, tm = build(**scen, **build_kw)
+    o.maximize(ps)
+    if o.check() != z3.sat:
+        return None, 0, True
+    best = float(o.model().eval(ps).as_fraction())
+    for rounds in range(max_rounds):
+        probe = build(**scen, **build_kw)
+        o2, ps2 = probe[0], probe[6]
+        o2.add(ps2 > best + eps)
+        if o2.check() != z3.sat:
+            return best, rounds, True                            # certificate: nothing strictly better
+        o2.maximize(ps2)                                         # improve inside the restricted region
+        o2.check()
+        best = float(o2.model().eval(ps2).as_fraction())
+    return best, max_rounds, False                               # gave up before certifying
+
+
+def solve_exact_model(scen, eps=1e-9, max_rounds=32, **build_kw):
+    """As solve_exact, but also returns an Optimize pinned to the certified optimum.
+
+    The certified value comes from a probe instance, so the configuration behind it must be recovered
+    on an instance the caller can read variables from. We rebuild once and constrain the objective to
+    the certified value, which leaves exactly the optimal configurations satisfiable.
+    """
+    import z3
+    best, rounds, certified = solve_exact(scen, eps=eps, max_rounds=max_rounds, **build_kw)
+    if best is None:
+        return None, None, rounds, certified
+    built = build(**scen, **build_kw)
+    o, ps = built[0], built[6]
+    o.add(ps >= best - eps)
+    assert o.check() == z3.sat, "the certified optimum became unsatisfiable when pinned"
+    return built, o.model(), rounds, certified
+
+
 def add_strength_order(opt, u, sel_attacks, surrogate, min_ba, order,
                        resync=None, nested=None, min_bits=0, min_psnr=None):
     import z3
@@ -415,11 +505,12 @@ def add_strength_order(opt, u, sel_attacks, surrogate, min_ba, order,
         TrustMark's -- so the solver can decline a front-end instead of being forced to treat
         every front-end as a pure gain."""
         expr, cons = surrogate.base(f, a).add_to_z3(s[f], f"base_{f}_{a}")
+        took_effect = False
         if nested is not None:
             c = surrogate.frontend(f"base_nested_{f}|{a}")
             if c is not None:
                 ne, nc = c.add_to_z3(s[f], f"basenest_{f}_{a}"); cons = cons + nc
-                expr = z3.If(nested, ne, expr)
+                expr = z3.If(nested, ne, expr); took_effect = True
         if resync is not None:
             c_on = surrogate.frontend(f"base_resync_{f}|{a}")
             if c_on is not None:
@@ -435,14 +526,19 @@ def add_strength_order(opt, u, sel_attacks, surrogate, min_ba, order,
                 c_off = surrogate.frontend(f"raw_synced_noresync_{f}|{a}")
                 if c_off is not None:
                     off_e, off_c = c_off.add_to_z3(s[f], f"basenoresync_{f}_{a}"); cons = cons + off_c
-                    expr = expr + z3.If(resync, on_e - off_e, z3.RealVal(0))
+                    expr = expr + z3.If(resync, on_e - off_e, z3.RealVal(0)); took_effect = True
                 else:
-                    expr = z3.If(resync, on_e, expr)   # no control measured: fall back to replacement
+                    expr = z3.If(resync, on_e, expr); took_effect = True   # no control: replacement
         # bit-accuracy is a rate: an effect large enough to push the sum past 1 is capped there, so
-        # a front-end can never make a fragment look better than a perfect decode.
-        capped = z3.Real(f"effba_{f}_{a}")
-        cons = cons + [capped == z3.If(expr > 1.0, z3.RealVal(1), expr)]
-        return capped, cons
+        # a front-end can never make a fragment look better than a perfect decode. Only a cell that
+        # actually took a front-end effect can exceed 1 -- a measured solo curve is already in
+        # [0,1] -- so the cap is added only there, which keeps this comparison out of the model for
+        # the great majority of (fragment, attack) cells.
+        if took_effect:
+            capped = z3.Real(f"effba_{f}_{a}")
+            cons = cons + [capped == z3.If(expr > 1.0, z3.RealVal(1), expr)]
+            return capped, cons
+        return expr, cons
 
     # NOTE for anyone comparing this solver against the grid enumerator in the necessity
     # experiment: that enumerator evaluates surrogate.base() directly and models no front-end
