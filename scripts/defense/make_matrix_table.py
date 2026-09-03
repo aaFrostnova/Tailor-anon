@@ -12,7 +12,7 @@ COL = [("clean","Clean"),("bright","Brgt"),("contrast","Cont"),("jpeg","JPEG"),(
        ("rs256","RS256"),("hflip","HFlip"),("crop_jpeg","CrpJ"),("vae_b","VAE-B"),("vae_c","VAE-C"),
        ("regen","Regen"),("rinse2x","Rin2"),("rinse4x","Rin4"),
        ("editing","Edit"),("img2video","I2V"),("ctrlregen","CtrlR"),("unmarker","UnMk")]
-ROW_ORDER = ["DwtDct","DwtDctSvd","RivaGAN","TrustMark-B","VINE-B","VINE-R","Ours","Ours-B+geo","Ours+geo"]
+ROW_ORDER = ["DwtDct","DwtDctSvd","RivaGAN","TrustMark-B","VINE-B","VINE-R","Ours","Ours-B+geo","Ours+geo","Ours (solver)"]
 
 def load(dirs):
     out = {}
@@ -20,6 +20,9 @@ def load(dirs):
         for f in sorted(glob.glob(os.path.join(d, "*.json"))):
             j = json.load(open(f)); m = j.get("method")
             if not m: continue
+            # A composite built from a solver configuration names itself "Ours[<frags>|<stages>]"; the
+            # table reports that row as the solver's answer to the matrix request (solve_table_request.py).
+            if m.startswith("Ours["): m = "Ours (solver)"
             o = out.setdefault(m, {"method": m, "n_bits": j.get("n_bits"), "psnr": None, "ssim": None, "attacks": {}})
             if j.get("n_bits") is not None: o["n_bits"] = j["n_bits"]
             if j.get("psnr") is not None: o["psnr"] = j["psnr"]
@@ -86,7 +89,7 @@ def latex(data, path):
         if not j: continue
         cells = " & ".join(cell(ba(j, c), bcol.get(c)) for c, _ in cols)
         av = avg(j, cols); avs = cell(av, bavg)
-        pre = "\\rowcolor{hl}\n" if m == "Ours" else ""; nm = "\\textbf{Ours}" if m == "Ours" else m
+        pre = "\\rowcolor{hl}\n" if m in ("Ours", "Ours (solver)") else ""; nm = f"\\textbf{{{m}}}" if m in ("Ours", "Ours (solver)") else m
         L.append(f"{pre}{nm} & {j['n_bits'] or ''} & {cells} & {avs} \\\\")
     L.append("\\bottomrule\n\\end{tabular}")
     L.append("\n% --- quality + mean detection ---")
@@ -111,7 +114,7 @@ def latex(data, path):
         mt = ("\\textbf{%.2f}" % mv) if (mv is not None and bt is not None and mv >= bt - 5e-3) else (f"{mv:.2f}" if mv is not None else "\\FILL")
         ps = ("\\textbf{%.2f}" % j["psnr"]) if (j["psnr"] is not None and bp is not None and j["psnr"] >= bp - 5e-3) else (f"{j['psnr']:.2f}" if j["psnr"] is not None else "\\FILL")
         ss = ("\\textbf{%.3f}" % j["ssim"]) if (j["ssim"] is not None and bs is not None and j["ssim"] >= bs - 5e-4) else (f"{j['ssim']:.3f}" if j["ssim"] is not None else "\\FILL")
-        pre = "\\rowcolor{hl}\n" if m == "Ours" else ""; nm = "\\textbf{Ours}" if m == "Ours" else m
+        pre = "\\rowcolor{hl}\n" if m in ("Ours", "Ours (solver)") else ""; nm = f"\\textbf{{{m}}}" if m in ("Ours", "Ours (solver)") else m
         cv = covered(j); cvs = ("\\textbf{%d/%d}" % (cv, n_att)) if cv == bcv else f"{cv}/{n_att}"
         L.append(f"{pre}{nm} & {j['n_bits'] or ''} & {ps} & {ss} & {mt} & {cvs} \\\\")
     L.append("\\bottomrule\n\\end{tabular}")

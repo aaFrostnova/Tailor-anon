@@ -63,3 +63,19 @@ def test_solve_exact_reports_unsat():
     sg = synthetic_surrogate(attacks=ATTACKS)
     best, _, certified = W.solve_exact(_scen(min_ba=1.01), **_kw(sg))
     assert best is None and certified
+
+
+def test_unmeasured_attack_is_refused_not_dropped():
+    """A request naming an attack the surrogate never measured must fail loudly.
+
+    Skipping it is the worst available behaviour: the constraint never enters the formula, the request
+    comes back SAT, and a user who asked for protection against that attack is handed a configuration
+    with no evidence behind it. This happened in practice -- a scenario set named a deep crop that had
+    never been measured, so the set silently reduced to the shallower crop it also contained while
+    reporting a satisfaction rate as if it had not.
+    """
+    import pytest
+    sg = synthetic_surrogate(attacks=ATTACKS)
+    scen = _scen(); scen["attacks"] = list(ATTACKS) + ["unmarker"]
+    with pytest.raises(ValueError, match="no measured surrogate"):
+        W.build(**scen, **_kw(sg))

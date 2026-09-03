@@ -6,7 +6,8 @@
 Regen/rinse/rot/crop bit-acc for VINE/TM come from frag_suite (n=20) + memory (regen 0.92/0.80, TM regen dead).
 """
 import json, sys, argparse
-from z3 import (Optimize, Bool, Int, Real, If, Or, And, Not, Implies, Sum, BoolVal, sat, is_true)
+from z3 import (Optimize, Bool, Int, Real, If, Or, And, Not, Implies, Sum, BoolVal, sat, is_true,
+                AtMost)
 CF="/work/pi_shiqingma_umass_edu/mingzheli/cryptographic_fingerprint"
 D=json.load(open(CF+"/results/defense/smt_inputs.json"))              # solo: VINE alpha-sweep + per-frag solo PSNR + timing
 DC=json.load(open(CF+"/results/defense/smt_inputs_composite.json"))    # composite PSNR stack anchors
@@ -216,6 +217,25 @@ def beta_from_fpr(alpha, n_tx=100, t_corr=10, k_data=37):
 def cost_ms(f):
     return D["fragments"][f]["embed_ms"]+D["fragments"][f]["decode_ms"]
 
+def presence_threshold(min_ba, k, n_tx=100, t_corr=10):
+    """The bit-accuracy threshold a k-fragment configuration must clear for the false-positive budget
+    that `min_ba` represents for one fragment.
+
+    Identity-level thresholds (BCH-decodable, `beta_id`) are untouched: each keyed test fails at
+    2^-37 and a union over three is still negligible. A presence-level threshold is a binomial tail at
+    the budget; the deployed decoder runs k+1 zero-bit tests on a k-fragment configuration -- one per
+    fragment, so that presence is best-path like the keyed tests, plus the fused one -- and every test
+    runs at budget/(k+1). Coverage must therefore be asked at the raised threshold, or the solver
+    declares covered a column the decoder cannot fire on at its budget."""
+    from scipy.stats import binom
+    beta_id = (n_tx - t_corr) / n_tx
+    if k <= 1 or min_ba >= beta_id - 1e-9:
+        return float(min_ba)
+    q = int(round(min_ba * n_tx)) - 1                 # min_ba = (q+1)/n_tx  <=>  P(X > q) <= budget
+    budget = float(binom.sf(q, n_tx, 0.5))            # the budget this threshold spends with one test
+    qk = binom.ppf(1.0 - budget / (k + 1), n_tx, 0.5)
+    return float(min(beta_id, (qk + 1.0) / n_tx))
+
 FR=["VINE","TrustMark","VideoSeal"]
 # ---------------------------------------------------------------------------------------------
 # RESOLUTION. Every table above (F, CAP, PSNR_SOLO, ALPHA, cost_ms, PEN*) is measured at 512x512 only.
@@ -301,6 +321,42 @@ try:
     BA_STD.update(BA_STD_FRESH)     # prefer the baseline's per-cell std
 except NameError:
     pass
+# Clean-image floors (follow-up item 3). `measure_clean_minimum.py` sweeps each fragment on unattacked
+# images and records, per strength, the mean/sd of the hard bit accuracy and the fraction of images that
+# clear the presence level; below the floor a fragment cannot be read reliably even before any attack,
+# so the solver must not propose it there whatever the mean curve says. Two levels: presence = the
+# zero-bit test (tau 0.63; floor = smallest strength with >=99% of images above tau) and identity = the
+# soft-decision crypto verify, which needs about 0.83 hard bit accuracy on the image at hand (floor =
+# smallest strength whose mean - z_0.99 * sd clears 0.83; the sweep stored no per-image values).
+# An identity request (min_bits > 0) takes the identity floor; a presence request interpolates in its
+# threshold between the two levels. Measured 2026-09-03 on the N=100 fitting slice:
+CLEAN_FLOOR_DEFAULT = {"VINE": (0.14, 0.30), "TrustMark": (0.55, 0.70), "VideoSeal": (0.50, 0.625)}
+CLEAN_FLOOR_JSON = _bos.environ.get("CLEAN_MIN_JSON",
+                                    "/scratch/workspace/mingzhel_umass_edu-ablator/wm_dataset10k/clean_minimum_strength.json")
+_CLEAN_IDENTITY_BA, _CLEAN_Z99, _CLEAN_PRESENCE_TAU = 0.83, 2.326, 0.63
+def clean_floor_levels(path=None):
+    """{fragment: (presence_floor, identity_floor)} from the clean sweep, or the baked defaults."""
+    path = path or CLEAN_FLOOR_JSON
+    try:
+        d = _bjson.load(open(path))
+    except (OSError, ValueError):
+        return dict(CLEAN_FLOOR_DEFAULT)
+    out = {}
+    for f, rows in d["rows"].items():
+        pres = next((r["s"] for r in rows if r["frac_presence"] >= 0.99), None)
+        ident = next((r["s"] for r in rows if r["ba_mean"] - _CLEAN_Z99 * r["ba_sd"] >= _CLEAN_IDENTITY_BA), None)
+        if pres is None or ident is None:
+            pres, ident = CLEAN_FLOOR_DEFAULT.get(f, (0.0, 0.0))
+        out[f] = (float(pres), float(max(pres, ident)))
+    return out
+def clean_floors(min_ba, min_bits=0, levels=None):
+    """Per-fragment minimum strength for a request: identity floor when identity bits are required,
+    otherwise linear in the threshold between the presence and identity levels."""
+    levels = levels if levels is not None else clean_floor_levels()
+    t = 1.0 if min_bits > 0 else min(1.0, max(0.0, (float(min_ba) - _CLEAN_PRESENCE_TAU) /
+                                                  (_CLEAN_IDENTITY_BA - _CLEAN_PRESENCE_TAU)))
+    return {f: round(p + t * (i - p), 4) for f, (p, i) in levels.items()}
+
 def live_required(attack, frags, min_ba, k=2.0):
     """True if the offline table cannot settle this (attack, config, threshold) -> measure on the user's image."""
     if attack in ADVERSARIAL: return True, "adversarial (per-image worst-case)"
@@ -335,14 +391,29 @@ def _check_resolution(res, attacks=()):
             f"signal/VAE cells do not transfer to 256. Measure those cells or pass resolution=512.")
 
 def build(min_psnr,max_ms,attacks,min_ba,allow_resync,allow_nested,min_bits=0,resolution=512,
-          enable_order=False,continuous_strength=False,surrogate=None):
+          enable_order=False,continuous_strength=False,surrogate=None,margin=0.0,clean_floor=None,
+          fe_gain_min=0.05):
     _check_resolution(resolution, attacks)
     surrogate_mode = (enable_order or continuous_strength) and surrogate is not None
     opt=Optimize()
     use={f:Bool(f) for f in FR}; resync=Bool("resync"); nested=Bool("nested")
+    # The deployed cascade exposes four stages. `resync` covers SyncSeal rectify plus the residual
+    # tilt (they share an embed-side mark and never run apart); `scale` is the VINE ring search,
+    # which is what `nested` used to stand for; `angle` is the blind probe, a decode-side front-end
+    # with no embed-side mark and so no PSNR cost at all -- it was never separately selectable.
+    fe_angle=Bool("fe_angle"); fe_tile=Bool("fe_tile")
+    FEV={"resync":resync, "scale":nested, "angle":fe_angle, "tile":fe_tile}
+    # At most one at a time. Three of them change what gets embedded, so a pair is an embed nobody
+    # measured -- the table holds a curve for "tiled TrustMark" and one for "TrustMark under a sync
+    # mark", and none for both at once. The bundled overlay says the restriction is cheap: running
+    # every stage beat the best single stage by a median 0.015 detection and never by more than
+    # 0.180, because the overlapping stages rescue the same images.
+    opt.add(AtMost(*FEV.values(), 1))
     a_lvl=Int("alpha_lvl")                                   # 0->0.5, 1->0.7, 2->1.0 (VINE only)
     opt.add(a_lvl>=0, a_lvl<=3)
     if not allow_resync: opt.add(Not(resync))
+    if not allow_resync and not allow_nested: opt.add(Not(fe_angle)); opt.add(Not(fe_tile))
+    opt.add(Implies(fe_tile, use["TrustMark"]))   # the tiled ring is a TrustMark-side embedding
     if not allow_nested: opt.add(Not(nested))
     opt.add(Implies(nested, use["VINE"]))
     opt.add(Implies(Not(use["VINE"]), a_lvl==3))            # alpha only meaningful with VINE
@@ -359,7 +430,24 @@ def build(min_psnr,max_ms,attacks,min_ba,allow_resync,allow_nested,min_bits=0,re
         opt.add(psnr>=min_psnr)            # on the surrogate objective (see add_strength_order);
                                            # binding the discrete expression as well would let a
                                            # tighter floor select a worse continuous optimum.
-    time=Sum([If(use[f],cost_ms(f),0.0) for f in FR]) + If(resync,FE_MS['resync'],0.0) + If(nested,FE_MS['nested'],0.0)
+    # Each stage is charged its own measured wall time. Under the bundled flags the solver paid
+    # 300 ms for resync and 1600 ms for nested no matter which stages actually ran.
+    def _fe_ms(cname, default):
+        if surrogate_mode and surrogate is not None:
+            v = [surrogate.latency(f"latency_ms_{cname}|{a}") for a in attacks]
+            # A stage's cost is measured as (decode with it) minus (decode without it). On a column
+            # where the primary decode already succeeds the stage never fires, so that difference is
+            # timing noise around zero and comes out negative about half the time. Left signed, a
+            # negative cost is a time REBATE for switching on a front-end that does nothing, which
+            # makes the useless stage attractive. A stage cannot make the decode faster.
+            v = [max(0.0, float(x)) for x in v if isinstance(x, (int, float))]
+            if v: return max(v)                # the cascade runs once; charge the worst requested column
+        return default
+    time=Sum([If(use[f],cost_ms(f),0.0) for f in FR]) \
+         + If(resync, _fe_ms("resync", FE_MS['resync']), 0.0) \
+         + If(nested, _fe_ms("scale",  FE_MS['nested']), 0.0) \
+         + If(fe_angle, _fe_ms("angle", 0.0), 0.0) \
+         + If(fe_tile,  _fe_ms("tile",  0.0), 0.0)
     opt.add(time<=max_ms)
     a_ge07 = a_lvl>=2
     if not surrogate_mode:
@@ -399,9 +487,11 @@ def build(min_psnr,max_ms,attacks,min_ba,allow_resync,allow_nested,min_bits=0,re
     if surrogate_mode:
         s_vars, p_vars, psnr_expr = add_strength_order(opt, use, attacks, surrogate, min_ba, enable_order,
                                                resync=resync, nested=nested, min_bits=min_bits,
-                                               min_psnr=min_psnr)
+                                               min_psnr=min_psnr, frontends=FEV, margin=margin,
+                                               clean_floor=clean_floor, fe_gain_min=fe_gain_min)
         psnr = psnr_expr          # override the discrete-PSNR expression with the surrogate PSNR
         opt._svars = s_vars; opt._pvars = p_vars    # expose for callers/tests
+        opt._fevars = FEV                            # the front-end decisions, one per cascade stage
     return opt,use,resync,nested,a_lvl,nfrag,psnr,time
 
 def solve_exact(scen, eps=1e-9, max_rounds=32, **build_kw):
@@ -455,17 +545,76 @@ def solve_exact_model(scen, eps=1e-9, max_rounds=32, **build_kw):
     o, ps = built[0], built[6]
     o.add(ps >= best - eps)
     assert o.check() == z3.sat, "the certified optimum became unsatisfiable when pinned"
+    # Among the configurations that hit the certified optimum, return one that switches on the
+    # fewest front-ends. A front-end costs no PSNR unless it changes the embed, and the latency
+    # budget only binds sometimes, so on many requests a stage that does nothing on the requested
+    # columns is free in the objective and z3 sets it either way. The optimum is the same; the
+    # configuration is not, and the method's claim is that what comes back is what the request
+    # needs. Ties among the remaining choices stay arbitrary -- this settles only this one.
+    fev = getattr(o, "_fevars", None)
+    if fev:
+        o.minimize(z3.Sum([z3.If(v, 1, 0) for v in fev.values()]))
+        assert o.check() == z3.sat, "pinning the optimum and minimising front-ends became unsat"
     return built, o.model(), rounds, certified
 
 
+def frontend_decisions(opt, model, resync=None, nested=None):
+    """The front-end half of the solver's answer, as {stage: bool}.
+
+    Read the stages off `opt._fevars` rather than off the two booleans the cascade used to collapse
+    into. Callers that read only resync/nested deploy a configuration the solver did not return:
+    the stages they drop are off in the deployment while the table credits them.
+    """
+    import z3
+    fev = getattr(opt, "_fevars", None)
+    if not fev:
+        fev = {}
+        if resync is not None: fev["resync"] = resync
+        if nested is not None: fev["scale"] = nested
+    return {k: bool(z3.is_true(model.eval(v, True))) for k, v in fev.items()}
+
+
+def frontend_config(fe):
+    """Map {stage: bool} onto the keys OursComposite reads, so one place owns the correspondence."""
+    return {"resync": fe.get("resync", False),
+            "nested": fe.get("scale", False),          # the ring is the embed side of the scale search
+            "scale_search": fe.get("scale", False),
+            "angle_sweep": fe.get("angle", False),
+            "tile": fe.get("tile", False)}
+
+
 def add_strength_order(opt, u, sel_attacks, surrogate, min_ba, order,
-                       resync=None, nested=None, min_bits=0, min_psnr=None):
+                       resync=None, nested=None, min_bits=0, min_psnr=None, frontends=None, margin=0.0,
+                       clean_floor=None, fe_gain_min=0.05):
     import z3
     assert set(surrogate.fragments) <= set(u.keys()), "surrogate fragments must be a subset of the solver's fragment vars"
+    # One decision variable per separately selectable geometric front-end. `resync` and `nested`
+    # stay accepted under their old names so existing callers keep working; a caller that passes
+    # `frontends` gets the full set the deployed cascade actually exposes.
+    FE_VARS = dict(frontends) if frontends else {}
+    if not FE_VARS:
+        if resync is not None: FE_VARS["resync"] = resync
+        if nested is not None: FE_VARS["scale"] = nested
+    FE_GAIN = set()          # stages that supplied a measured gain on at least one cell
+    # A stage is RESPONSIBLE for a requested column when its replacement curve beats the plain curve
+    # by at least `fe_gain_min` somewhere in the strength range for some fragment (0.05 is about
+    # 2.5 standard errors of a mean bit accuracy at N=100). A stage responsible for none of the
+    # requested columns is fixed off: its non-geometric replacement curves differ from the plain ones
+    # only by measurement noise, and left free the optimizer buys that noise (resync was selected on a
+    # signal+VAE+regeneration request for a 0.05 dB gain). This is also what keeps the instance small
+    # on requests without geometry.
+    FE_RESP = {}
     FRs = surrogate.fragments
     s = {f: z3.Real(f"s_{f}") for f in FRs}
+    # Strength range = [max(table range, clean-image floor for this request's level), table top].
+    # `clean_floor=None` reads the measured floors; `{}` switches them off; a dict pins them.
+    floors = clean_floors(min_ba, min_bits) if clean_floor is None else dict(clean_floor)
+    opt._clean_floors = {}
     for f in FRs:
         lo,hi = surrogate.range(f)
+        lo = max(lo, floors.get(f, lo))
+        assert lo <= hi, f"clean floor {lo} above the measured top {hi} for {f}"
+        opt._clean_floors[f] = lo
         opt.add(z3.Implies(u[f], z3.And(s[f] >= lo, s[f] <= hi)))
         opt.add(z3.Implies(z3.Not(u[f]), s[f] == 0))
     # precedence booleans (only meaningful among selected)
@@ -495,6 +644,10 @@ def add_strength_order(opt, u, sel_attacks, surrogate, min_ba, order,
     # Leaving them gated has a cost that is easy to miss: a gate that is false leaves its curve
     # variable free, and a free real sitting inside an ite term is enough to make the optimizer
     # report a suboptimal point as optimal.
+    def after_of(f, g):
+        """z3 condition: g is selected and embedded after f (overwrites f)."""
+        return z3.And(p[(f,g)], u[g]) if order else z3.And(u[g], z3.BoolVal(FRs.index(g)>FRs.index(f)))
+    pair_used = {}       # (f,g,a) -> z3 bool: the two-fragment curve stands in for single-curve + delta
     def eff_base(f, a):
         """Front-end-aware base curve for (f,a), as (z3 expr, domain constraints).
 
@@ -506,29 +659,67 @@ def add_strength_order(opt, u, sel_attacks, surrogate, min_ba, order,
         every front-end as a pure gain."""
         expr, cons = surrogate.base(f, a).add_to_z3(s[f], f"base_{f}_{a}")
         took_effect = False
-        if nested is not None:
-            c = surrogate.frontend(f"base_nested_{f}|{a}")
-            if c is not None:
-                ne, nc = c.add_to_z3(s[f], f"basenest_{f}_{a}"); cons = cons + nc
-                expr = z3.If(nested, ne, expr); took_effect = True
-        if resync is not None:
-            c_on = surrogate.frontend(f"base_resync_{f}|{a}")
-            if c_on is not None:
-                on_e, on_c = c_on.add_to_z3(s[f], f"baseresync_{f}_{a}"); cons = cons + on_c
-                # A front-end enters as the EFFECT it was measured to have, not as a replacement
-                # level. The effect is (front-end on) minus (its control, measured in the same run
-                # with the front-end disabled), so the two sides of the switch are compared on the
-                # same images; adding that effect to the solo curve keeps the absolute level
-                # anchored to the same curve every other attack uses. Written as a replacement
-                # instead, turning the front-end OFF would silently move the fragment onto a
-                # different curve than the one the rest of the model -- and any enumerator
-                # comparing against it -- reads.
-                c_off = surrogate.frontend(f"raw_synced_noresync_{f}|{a}")
-                if c_off is not None:
-                    off_e, off_c = c_off.add_to_z3(s[f], f"basenoresync_{f}_{a}"); cons = cons + off_c
-                    expr = expr + z3.If(resync, on_e - off_e, z3.RealVal(0)); took_effect = True
-                else:
-                    expr = z3.If(resync, on_e, expr); took_effect = True   # no control: replacement
+        # Each geometric front-end is a separate decision with its own measured curve. They used to
+        # be two booleans, `resync` and `nested`, standing for a cascade that ran all four of its
+        # stages whenever either was set -- so the table credited one stage's recovery to another,
+        # and three geometric columns (rs256, hflip, crop_jpeg) had no entry at all and were filled
+        # in by hardcoded `if attack in (...)` rules rather than by measurement.
+        #
+        # A front-end enters as a REPLACEMENT level, not as an effect added to the plain curve.
+        # Three of the four change what gets EMBEDDED -- the sync mark is laid on top, the ring
+        # re-embeds VINE at three scales, the tiled grid replaces TrustMark's embed outright -- so
+        # the plain curve stops describing the configuration the moment one is switched on, and it
+        # can stop describing it by a lot. Measured: plain TrustMark reads 1.000 on crop75 while
+        # the tiled embed's own bare decode reads 0.497, because a mark written into 256px cells
+        # no longer lines up with the decoder's canonical tiles once the picture is cropped and
+        # rescaled. Added to the plain curve, the model would have promised 1.000 for a
+        # configuration that delivers chance. `base_fe_*` was measured under that stage's embed AND
+        # its cascade, so it is the level itself.
+        levels = []
+        for cname, cvar in (FE_VARS or {}).items():
+            if cvar is None: continue
+            c_on = surrogate.frontend(f"base_fe_{cname}_{f}|{a}")
+            if c_on is None: continue
+            plain = surrogate.base(f, a)
+            grid = sorted(set(plain.xs) | set(c_on.xs))
+            gain = max(c_on.eval(x) - plain.eval(x) for x in grid)
+            if gain >= fe_gain_min:
+                FE_RESP.setdefault(cname, set()).add(a)
+            on_e, on_c = c_on.add_to_z3(s[f], f"feon_{cname}_{f}_{a}"); cons = cons + on_c
+            # Two-fragment replacement curve: the host swept with a partner embedded AFTER it (at the
+            # partner's mid strength) and the stage on, on the columns the stage is responsible for.
+            # Where it exists and the partner is selected after the host, it is the level -- it already
+            # contains the partner's interference, so the delta term for that pair is dropped below.
+            for g in FRs:
+                if g == f: continue
+                c_pair = surrogate.frontend(f"base_fe_{cname}_{f}|{a}|with_{g}")
+                if c_pair is None: continue
+                pe_, pc_ = c_pair.add_to_z3(s[f], f"fepair_{cname}_{f}_{g}_{a}"); cons = cons + pc_
+                use_pair = z3.And(cvar, after_of(f, g))
+                on_e = z3.If(use_pair, pe_, on_e)
+                pair_used[(f, g, a)] = z3.Or(pair_used.get((f, g, a), z3.BoolVal(False)), use_pair)
+            levels.append((cvar, on_e)); FE_GAIN.add(cname)
+        if levels:
+            # At most one front-end is enabled (asserted where the variables are created), so the
+            # chain is a selection rather than a combination: no term here describes a pair, and no
+            # pair was measured. The additivity check on the bundled overlay is what makes that
+            # restriction cheap -- running every stage recovered a median 0.015 more detection than
+            # the best single stage did, and at most 0.180, because the stages that overlap are
+            # rescuing the same images rather than different ones.
+            for cvar, lvl in levels:
+                expr = z3.If(cvar, lvl, expr)
+            took_effect = True
+        if not levels:
+            # Fallback for tables predating the per-stage split, which held one curve per bundled
+            # flag. Also a replacement: the argument that once favoured an additive effect assumed
+            # the control matched the plain curve, and for a front-end that changes the embed it
+            # does not -- that is the whole reason this branch was rewritten.
+            for cvar, key in ((nested, f"base_nested_{f}|{a}"), (resync, f"base_resync_{f}|{a}")):
+                if cvar is None: continue
+                c = surrogate.frontend(key)
+                if c is None: continue
+                lv, lc = c.add_to_z3(s[f], f"legacyfe_{f}_{a}_{key.split('_')[1]}"); cons = cons + lc
+                expr = z3.If(cvar, lv, expr); took_effect = True
         # bit-accuracy is a rate: an effect large enough to push the sum past 1 is capped there, so
         # a front-end can never make a fragment look better than a perfect decode. Only a cell that
         # actually took a front-end effect can exceed 1 -- a measured solo curve is already in
@@ -546,8 +737,42 @@ def add_strength_order(opt, u, sel_attacks, surrogate, min_ba, order,
     # necessity scenarios with allow_resync=False, allow_nested=False (which forces both booleans
     # false, collapsing eff_base to the plain curve) or the z3-vs-grid comparison is not like-for-like.
 
+    # An embed-changing stage changes what the affected fragment looks like on EVERY column. Where a
+    # requested column has no replacement curve for it, eff_base would fall back to the plain curve and
+    # credit an embed that was never measured -- tiled TrustMark under VAE compression read the plain
+    # TrustMark curve, promised 0.94, delivered 0.82, and was certified a false SAT live. So on such a
+    # request the stage may not be enabled together with the fragment it changes. Tables that predate
+    # the per-stage curves (no base_fe_* cell at all) keep the legacy bundled behaviour.
+    FE_AFFECTS = {"resync": list(FRs), "scale": ["VINE"], "tile": ["TrustMark"]}   # angle changes no embed
+    if any(k.startswith("base_fe_") for k in getattr(surrogate, "_frontend", {})):
+        for cname, affected in FE_AFFECTS.items():
+            cvar = (FE_VARS or {}).get(cname)
+            if cvar is None: continue
+            for f in affected:
+                if f not in FRs: continue
+                unmeasured = [a for a in sel_attacks if surrogate.frontend(f"base_fe_{cname}_{f}|{a}") is None]
+                if unmeasured:
+                    opt.add(z3.Implies(cvar, z3.Not(u[f])))
+
+    missing = [a for a in sel_attacks if a not in surrogate.attacks]
+    if missing:
+        # Silently skipping an unmeasured attack is the worst available answer: the request comes back
+        # SAT with that constraint never having entered the formula, so a user who asked for protection
+        # against it is handed a configuration with no evidence behind it. This is the same rule
+        # _check_resolution already applies to the resolution axis, applied to the attack axis.
+        raise ValueError(
+            f"no measured surrogate for {sorted(set(missing))}; the request cannot be answered. "
+            f"Measured attacks: {sorted(surrogate.attacks)}")
+    # Presence is decided per fragment in the deployed decoder, with the budget split over the tests,
+    # so a k-fragment configuration is held to the k-fragment threshold (see presence_threshold).
+    # `margin` is the request's safety allowance above the derived threshold. The certified optimum
+    # otherwise sits exactly on the threshold, where half of the live measurements land below it by
+    # sampling alone; a margin of about two table standard errors (0.02) buys that back for a little
+    # fidelity. It is a request parameter with default 0, so the semantics without it are unchanged.
+    nsel = z3.Sum([z3.If(u[g], 1, 0) for g in FRs])
+    _t = lambda k: z3.RealVal(min(1.0, presence_threshold(min_ba, k) + float(margin)))
+    thr = z3.If(nsel <= 1, _t(1), z3.If(nsel == 2, _t(2), _t(3)))
     for a in sel_attacks:
-        if a not in surrogate.attacks: continue
         clears = []
         for f in FRs:
             bexpr,bc = eff_base(f, a)
@@ -557,9 +782,11 @@ def add_strength_order(opt, u, sel_attacks, surrogate, min_ba, order,
                 if g==f: continue
                 dexpr,dc = surrogate.delta(g,f,a).add_to_z3(s[g], f"del_{g}_{f}_{a}")
                 for c in dc: opt.add(c)
-                after = z3.And(p[(f,g)], u[g]) if order else z3.And(u[g], z3.BoolVal(FRs.index(g)>FRs.index(f)))
+                after = after_of(f, g)
+                if (f, g, a) in pair_used:                       # the pair curve already holds the interference
+                    after = z3.And(after, z3.Not(pair_used[(f, g, a)]))
                 drops.append(z3.If(after, dexpr, z3.RealVal(0)))
-            clears.append(z3.And(u[f], bexpr - z3.Sum(drops) >= min_ba))   # fragment f (if selected) clears attack a
+            clears.append(z3.And(u[f], bexpr - z3.Sum(drops) >= thr))      # fragment f (if selected) clears attack a
         opt.add(z3.Or(*clears))                                            # at least one selected fragment clears a
     # distortion D = sum_f d_f(s_f) + sum_{f<g} e_{fg}(s_f+s_g) [gated by co-select]; PSNR = -D proxy
     dterms=[]
@@ -581,6 +808,43 @@ def add_strength_order(opt, u, sel_attacks, surrogate, min_ba, order,
         gate = z3.And(nested, u["VINE"])
         for c in npcons: opt.add(c)
         dterms.append(z3.If(gate, npe, z3.RealVal(0)))
+    # Every EMBED-side front-end costs fidelity, not just the nested ring. The SyncSeal mark goes on
+    # top of the image and the tiled ring replaces TrustMark's embed; left uncharged they are free,
+    # and a front-end that is free and can only raise coverage will always be switched on -- the
+    # solver would return front-ends it has no reason to return. The cost is a measured function of
+    # the carrying fragment's strength, on the same MSE scale as d and e.
+    FE_HOST = {"resync": "TrustMark", "scale": "VINE", "tile": "TrustMark"}
+    for cname, host in FE_HOST.items():
+        if cname == "scale": continue                    # already charged as nested_penalty above
+        cvar = (FE_VARS or {}).get(cname)
+        pc = surrogate.frontend(f"penalty_fe_{cname}")
+        if cvar is None or pc is None or host not in FRs: continue
+        pe, pcons = pc.add_to_z3(s[host], f"fepen_{cname}")
+        for c in pcons: opt.add(c)
+        # A front-end is bought for coverage, never as a fidelity rebate. The tiled grid measures a
+        # slightly NEGATIVE cost (it writes a little less energy than the full-frame embed, -0.1 to
+        # -1.6 MSE) and, left signed, that rebate alone made the solver attach the grid to a TrustMark
+        # that covered nothing -- a structural choice driven by 0.04 dB. The lower energy is already
+        # accounted for where it matters, in the stage's lower replacement curves.
+        dterms.append(z3.If(z3.And(cvar, u[host]), z3.If(pe > 0, pe, z3.RealVal(0)), z3.RealVal(0)))
+    # Prune: a stage with no responsible column among the requested attacks is fixed off.
+    opt._fe_responsible = {k: sorted(v) for k, v in FE_RESP.items()}
+    for cname, cvar in (FE_VARS or {}).items():
+        if cvar is None or cname not in FE_GAIN: continue
+        if not FE_RESP.get(cname):
+            opt.add(z3.Not(cvar))
+    # A stage that supplies a measured GAIN but carries no measured COST is free, and a free stage
+    # that can only raise coverage is switched on in every optimal model. Silently skipping the
+    # missing cost is how it stayed free; the request cannot be answered without it.
+    for cname, host in FE_HOST.items():
+        if cname == "scale": continue                    # charged above as nested_penalty
+        if cname not in FE_GAIN or host not in FRs: continue
+        if (FE_VARS or {}).get(cname) is None: continue
+        if surrogate.frontend(f"penalty_fe_{cname}") is None:
+            raise ValueError(
+                f"front-end '{cname}' has a measured effect but no measured fidelity cost "
+                f"(penalty_fe_{cname}); it would be free and always selected. Measure it, or drop "
+                f"the stage from the request.")
     D = z3.Real("D_total"); opt.add(D == z3.Sum(dterms))
     psnr = z3.Real("psnr_surro"); opt.add(psnr == -D)     # monotone proxy; real dB mapping applied post-hoc
 
@@ -601,11 +865,19 @@ def add_strength_order(opt, u, sel_attacks, surrogate, min_ba, order,
         for a in sel_attacks:
             caps = []
             for f in FRs:
+                # Capacity curves are measured for the PLAIN embed. The tiled grid changes TrustMark's
+                # embed so much that its bit accuracy on the non-geometric columns sits far below the
+                # plain curve (0.46 against 0.67 at the lowest knot under VAE), so the plain capacity
+                # would credit bits the tiled embed cannot carry; a tiled TrustMark therefore carries
+                # no capacity credit. The ring and the sync mark measure within a few points of the
+                # plain curve and keep it.
+                tile_var = (FE_VARS or {}).get("tile")
+                carries = u[f] if not (f == "TrustMark" and tile_var is not None) else z3.And(u[f], z3.Not(tile_var))
                 cp = getattr(surrogate, "cap", lambda *_: None)(f, a)
                 if cp is not None:
                     ce, cc = cp.add_to_z3(s[f], f"cap_{f}_{a}")
                     for c in cc: opt.add(c)
-                    caps.append(z3.And(u[f], ce >= min_bits))
+                    caps.append(z3.And(carries, ce >= min_bits))
                 else:
                     # No measured curve for this cell (the strength sweep covers the in-process
                     # family; the diffusion family was measured at reference strengths only), so
@@ -614,7 +886,7 @@ def add_strength_order(opt, u, sel_attacks, surrogate, min_ba, order,
                     # rather than silently dropping out on the attacks that lack a curve.
                     const = CAP.get(f, {}).get(a)
                     if const is not None:
-                        caps.append(z3.And(u[f], z3.BoolVal(float(const) >= min_bits)))
+                        caps.append(z3.And(carries, z3.BoolVal(float(const) >= min_bits)))
             if caps: opt.add(z3.Or(*caps))
     return s, p, psnr
 

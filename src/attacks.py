@@ -68,6 +68,24 @@ def crop_then_jpeg(img, frac=0.75, quality=25):
     buf = io.BytesIO(); out.save(buf, format="JPEG", quality=quality)
     return Image.open(io.BytesIO(buf.getvalue())).convert("RGB")
 
+def border_crop(img, frac=0.20):
+    """Translation crop: drop a border of `frac` of the side from the top and left, then push the
+    surviving content to the origin, leaving the vacated right/bottom black.
+
+    This is a DIFFERENT operator from center_crop_area, and the difference is the whole point: a
+    center crop keeps the picture centred and only rescales it, so a mark that survives rescaling
+    survives it, whereas this one TRANSLATES the content off its embedding grid. Plain TrustMark
+    holds the centre crops and breaks here, which is the column a spatially redundant embedding is
+    for. Frame size is preserved so the operator composes with the rest of the suite.
+    """
+    W, H = img.size
+    d = int(round(min(W, H) * float(frac)))
+    reg = img.crop((d, d, W, H))
+    out = Image.new("RGB", (W, H))
+    out.paste(reg, (0, 0))
+    return out
+
+
 GEO = {
     "crop75": lambda im: center_crop_area(im, 0.75),          # 75% of the AREA (side 0.866)
     "crop50": lambda im: center_crop_area(im, 0.50),          # 50% of the AREA (side 0.707)
@@ -75,6 +93,7 @@ GEO = {
     "rs256":  lambda im: resize_down_up(im, 256),
     "hflip":  lambda im: im.transpose(Image.FLIP_LEFT_RIGHT),
     "crop_jpeg": crop_then_jpeg,
+    "border20": lambda im: border_crop(im, 0.20),         # TRANSLATION crop, not a centre crop
 }
 
 # ---------------------------------------------------------------- signal family (WAVES numerics)

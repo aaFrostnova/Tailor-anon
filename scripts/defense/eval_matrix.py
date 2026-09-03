@@ -23,7 +23,10 @@ sys.path.insert(0, os.path.join(REPO, "external", "WatermarkAttacker"))
 SD21 = "/project/pi_shiqingma_umass_edu/mingzheli/model/stable-diffusion-2-1"
 KEY = b"v5_key_encoder_master"
 ATTACKS = ["clean", "jpeg", "blur", "noise", "bright", "contrast", "bm3d", "regen", "rinse2x", "rinse4x", "vae_b", "vae_c"]
-GEO_ATTACKS = ["crop75", "crop50", "rot9", "rs256", "hflip", "crop_jpeg"]
+# Listed rather than derived so the reported column ORDER is stable, but checked against the shared
+# definition below: an attack added to src.attacks.GEO and not added here would be measured by the
+# surrogate and never by the matrix, and the two would quietly describe different suites.
+GEO_ATTACKS = ["crop75", "crop50", "rot9", "rs256", "hflip", "crop_jpeg", "border20"]
 ALL_ATTACKS = ATTACKS + GEO_ATTACKS
 
 # ---------------- attack layer ----------------
@@ -33,6 +36,10 @@ ALL_ATTACKS = ATTACKS + GEO_ATTACKS
 from src.attacks import (GEO, center_crop_resize as _center_crop_resize,
                          rotate_reflect as _rotate_reflect, resize_down_up as _resize_down_up,
                          crop_then_jpeg as _crop_then_jpeg_pil, SIGNAL_PARAMS)
+assert set(GEO_ATTACKS) == set(GEO), (
+    f"the matrix's geometric suite and the shared definitions disagree: "
+    f"only in GEO_ATTACKS {sorted(set(GEO_ATTACKS) - set(GEO))}, "
+    f"only in src.attacks.GEO {sorted(set(GEO) - set(GEO_ATTACKS))}")
 
 def _crop_then_jpeg(ip, op, frac=0.75, quality=25):
     _crop_then_jpeg_pil(Image.open(ip).convert("RGB"), frac=frac, quality=quality).save(op)
@@ -158,12 +165,26 @@ class OursComposite:
         for f in self.order:
             if f not in self.frag: raise ValueError(f"unknown fragment in config: {f}")
         self.strength = dict(self.DEFAULT_STRENGTH); self.strength.update(cfg.get("strengths") or {})
-        self.nested = bool(cfg.get("nested", geo))
-        self.resync = bool(cfg.get("resync", geo))
-        self.geo = self.nested or self.resync
+        # Each geometric front-end is a separate decision. They used to collapse into one `geo`
+        # flag, which made the cascade run all four of its stages whenever either of the two
+        # booleans was set: asking for resync silently also paid for the VINE scale search, and
+        # asking for the nested ring silently also paid for SyncSeal and the blind angle sweep.
+        # The solver charges these separately, so they have to be separately switchable.
+        self.nested = bool(cfg.get("nested", geo))            # embed-side: nested VINE ring
+        self.resync = bool(cfg.get("resync", geo))            # embed-side: SyncSeal mark + rectify
+        self.fe_scale = bool(cfg.get("scale_search", self.nested))   # decode-side: ring scale search
+        self.fe_angle = bool(cfg.get("angle_sweep", self.resync))    # decode-side: blind angle probe
+        # Spatially redundant TrustMark: the same crypto codeword in every cell of a 2x2 grid, with a
+        # sliding-window crypto-verify at decode. The centre crops in the suite rescale the picture
+        # and leave it centred, which plain TrustMark survives; a TRANSLATION crop moves the content
+        # off the embedding grid, and this is the front-end for that column.
+        self.fe_tile = bool(cfg.get("tile", False))                  # both-side: tiled embed + window search
+        self.geo = self.nested or self.resync or self.fe_scale or self.fe_angle or self.fe_tile
         if config:
             self.name = "Ours[" + "+".join(self.order) + \
-                        ("|R" if self.resync else "") + ("|N" if self.nested else "") + "]"
+                        ("|R" if self.resync else "") + ("|N" if self.nested else "") + \
+                        ("|S" if self.fe_scale else "") + ("|A" if self.fe_angle else "") + \
+                        ("|T" if self.fe_tile else "") + "]"
         elif geo:
             self.name += "+geo"
         if self.geo:
@@ -171,7 +192,15 @@ class OursComposite:
             from src.syncseal_frontend import load_sync, sync_embed, sync_rectify
             from src.fusion_head3 import load_head3, head3_llr
             self._scale_resid, self._nested, self._rot = scale_resid, nested_vine_embed, rot
-            self._sync = load_sync(dev=dev); self._sync_embed, self._sync_rectify = sync_embed, sync_rectify
+            self._sync_embed, self._sync_rectify = sync_embed, sync_rectify
+            # The SyncSeal model is only needed by the resync stage. A config that asks only for the
+            # blind angle sweep is a decode-side front-end with no embed-side mark and no model.
+            self._sync = load_sync(dev=dev) if self.resync else None
+            if self.fe_tile:
+                from src.tiled_trustmark import TiledTrustMark
+                self._tiled = TiledTrustMark(self.frag["trustmark"], self.sb)
+            else:
+                self._tiled = None
             h3 = os.path.join(REPO, "results/defense/frag3_head.pt")
             self._head3 = load_head3(h3, dev) if os.path.exists(h3) else None
             self._head3_llr = head3_llr
@@ -190,6 +219,8 @@ class OursComposite:
             w = apply_crypto(tx, perm, M); s = float(self.strength.get(name, 1.0))
             if name == "vine" and self.nested:                # nested ring is a VINE-side front-end
                 img = self._nested(m, img, w, scales=(1.0, 0.75, 0.5), strength=s)
+            elif name == "trustmark" and self.fe_tile:        # tiled ring is a TrustMark-side front-end
+                img = self._tiled.embed(img, w, strength=s)
             else:
                 img = m.embed_with_target(img, w, strength=s)
             if img.size != (512, 512): img = img.resize((512, 512))
@@ -206,35 +237,50 @@ class OursComposite:
         from src.soft_bch import decode_and_verify
         return bool(decode_and_verify(rl, iid, codec=self.sb)["detected"])
 
-    def geo_cascade(self, att, iid, tx):
-        """Crypto-verify-gated geometric search (SyncSeal -> refine -> VINE-scale -> blind angle)."""
+    def geo_cascade(self, att, iid, tx, return_view=False):
+        """Crypto-verify-gated geometric search over four separately selectable stages:
+        S1/S2 SyncSeal rectify + residual tilt (self.resync), S3 VINE ring scale search
+        (self.fe_scale), S4 blind angle probe (self.fe_angle). A stage the config did not ask
+        for does not run, so its latency is not paid and its effect is not credited."""
         import numpy as _np
         present = [f for f in ("vine", "trustmark", "videoseal") if f in self.order]
-        geo_frag = "trustmark" if "trustmark" in present else (present[-1] if present else None)
-        if geo_frag is None: return False
-        rect, _ = self._sync_rectify(self._sync, att, self.dev)
-        for name in present:
-            if self._cv(self._frag_llr(name, rect, iid), iid): return True
-        for d in (-3.0, 3.0, -6.0, 6.0):
-            if self._cv(self._frag_llr(geo_frag, self._rot(rect, d), iid), iid): return True
-        if "vine" in present:
+        if not present: return (False, None) if return_view else False
+        if self.resync:                                       # S1+S2: SyncSeal rectify, then residual tilt
+            rect, _ = self._sync_rectify(self._sync, att, self.dev)
+            for name in present:
+                if self._cv(self._frag_llr(name, rect, iid), iid):
+                    return (True, rect) if return_view else True
+            for d in (-3.0, 3.0, -6.0, 6.0):                  # residual tilt after rectification
+                rimg = self._rot(rect, d)
+                for name in present:                      # every present fragment, not a chosen one
+                    if self._cv(self._frag_llr(name, rimg, iid), iid):
+                        return (True, rimg) if return_view else True
+        if self.fe_scale and "vine" in present:               # S3: VINE ring scale search
             for f in _np.arange(0.34, 1.0001, self._vss):
                 if f >= 0.999: view = att
                 else:
                     s = int(round(512 * float(f))); o = (512 - s) // 2; view = att.crop((o, o, o + s, o + s))
-                if self._cv(self._frag_llr("vine", view, iid), iid): return True
-        best_d, best_ba = 0.0, -1.0
-        for d in _np.arange(-self._rr, self._rr + 0.01, self._bc):
-            rl = self._frag_llr(geo_frag, self._rot(att, float(d)), iid)
-            if self._cv(rl, iid): return True
-            ba = float(_np.mean((rl > 0).astype(_np.uint8) == tx))
-            if ba > best_ba: best_ba, best_d = ba, d
-        if best_ba < self._bg: return False                   # info-loss, not misalignment -> abort
-        for d in _np.arange(best_d - self._bc, best_d + self._bc + 0.01, self._rs):
-            rimg = self._rot(att, float(d))
-            for name in present:
-                if self._cv(self._frag_llr(name, rimg, iid), iid): return True
-        return False
+                if self._cv(self._frag_llr("vine", view, iid), iid):
+                    return (True, view) if return_view else True
+        # Angle candidates come from a fragment-independent probe (src/angle_probe.py). The sweep used
+        # to be driven by one payload fragment and to abort on that fragment's bit accuracy, which asks
+        # a mark the rotation may already have destroyed how to undo the rotation: a configuration
+        # whose fragments are rotation-fragile made the sweep inert, so whether rotation was
+        # recoverable depended on which fragments the request happened to select. The probe reads the
+        # image instead, proposes an ordering, and every candidate is still admitted only by the keyed
+        # verification -- so a longer list costs time, never false accepts.
+        if self.fe_tile and "trustmark" in present:           # S5: sliding-window crypto-verify
+            perm, M = self.frag["trustmark"].get_perm_M(iid)
+            ok, win = self._tiled.crop_recover(att, iid, perm, M, return_view=True)
+            if ok: return (True, win) if return_view else True
+        if self.fe_angle:                                     # S4: fragment-independent blind angle sweep
+            from src.angle_probe import candidate_angles
+            for d in candidate_angles(att, search=self._rr, step=self._bc, refine=self._rs):
+                rimg = self._rot(att, float(d))
+                for name in present:
+                    if self._cv(self._frag_llr(name, rimg, iid), iid):
+                        return (True, rimg) if return_view else True
+        return (False, None) if return_view else False
 
     def decode_no_cascade(self, att, secret):
         """The same decode with the geometric cascade suppressed.
@@ -263,10 +309,37 @@ class OursComposite:
             fused = fuse_llrs(aligned, weights=None, n_codeword=self.sb.n)
         fba = float(np.mean(llr_to_bits(fused) == tx))
         fver = bool(decode_and_verify(fused, image_id, codec=self.sb)["detected"])
-        det = fver or bestpath or (fba >= self.tau)
+        # Presence is best-path as well: one live fragment fires the zero-bit test even when a dead
+        # partner dilutes the fused value below threshold (crop-then-JPEG read 0.63 on VideoSeal and
+        # 0.58 fused, and the fused-only test fired on 23.5% of images the solver had covered). The
+        # per-fragment and fused tests share the 1% budget, so their thresholds rise with the count.
+        per_ba = {n: float(np.mean(llr_to_bits(a) == tx)) for n, a in aligned.items()}
+        det = fver or bestpath or presence_detected(per_ba, fba, len(aligned))
         if self.geo and not det:                              # geometric cascade fires only on primary miss
-            det = bool(self.geo_cascade(att, image_id, tx))
+            ok, view = self.geo_cascade(att, image_id, tx, return_view=True)
+            if ok:
+                det = True
+                # Report the accuracy of the view the decoder ACCEPTED. Left on `att`, this number
+                # describes an alignment the decoder did not use: the crop50 cell read 0.55 -- a
+                # miss -- while the deployed decoder was accepting the image, so bit accuracy and
+                # detection disagreed on every cell the cascade rescued. It also makes the
+                # front-end's effect measurable in the same unit as the base curves, which is what
+                # the coverage clause compares against beta.
+                rl = {n: self._frag_llr(n, view, image_id) for n in self.order}
+                fba = float(np.mean(llr_to_bits(fuse_llrs(rl, weights=None, n_codeword=self.sb.n)) == tx))
         return fba, det
+
+def presence_tau(n_frag, n_bits, alpha=0.01):
+    """Zero-bit threshold when a k-fragment configuration runs k+1 zero-bit tests (one per fragment,
+    plus the fused codeword) inside one false-positive budget: each test gets alpha/(k+1). A single
+    fragment's fused codeword IS its own, so it runs one test at alpha."""
+    n_tests = 1 if n_frag <= 1 else n_frag + 1
+    return float(binom.ppf(1.0 - alpha / n_tests, n_bits, 0.5) + 1) / n_bits
+
+def presence_detected(per_ba, fused_ba, n_frag, n_bits=100, alpha=0.01):
+    """Best-path presence: any fragment, or the fusion, above the budget-split threshold."""
+    tau = presence_tau(n_frag, n_bits, alpha)
+    return bool(fused_ba >= tau or any(v >= tau for v in per_ba.values()))
 
 def _id_payload(image_id, nb):
     from src.payload import image_id_to_payload
@@ -409,7 +482,13 @@ def main():
                    default=["ours", "dwtDct", "dwtDctSvd", "rivaGan", "trustmark_b", "vine_b", "vine_r"])
     p.add_argument("--attacks", nargs="+", default=ALL_ATTACKS)
     p.add_argument("--tm_variant", default="B")
-    p.add_argument("--geo", action="store_true", help="enable Ours geometric front-end (nested-VINE + SyncSeal + geo_cascade)")
+    # --geo turned three independent decisions into one switch, which is what the solver is for.
+    # It stays only as a shorthand for "every stage on", and --frontend names them individually.
+    p.add_argument("--geo", action="store_true",
+                   help="shorthand for --frontend resync scale angle (every stage on)")
+    p.add_argument("--frontend", nargs="*", default=None, choices=["resync", "scale", "angle"],
+                   help="geometric front-end stages to enable, chosen individually; the method "
+                        "returns these per request rather than bundling them")
     p.add_argument("--config", default=None,
                    help="JSON file OR inline JSON with the solver's configuration "
                         "{frags, order, strengths, resync, nested}; when given, the Ours row is the "
@@ -436,6 +515,13 @@ def main():
         if os.path.exists(oj):
             print(f"[skip] {mname} (exists)", flush=True); continue
         try:
+            if args.frontend is not None:
+                fe = set(args.frontend)
+                cfg = dict(cfg or {})
+                cfg.setdefault("resync", "resync" in fe)
+                cfg.setdefault("nested", "scale" in fe)
+                cfg.setdefault("scale_search", "scale" in fe)
+                cfg.setdefault("angle_sweep", "angle" in fe)
             method = build_method(mname, dev, args.tm_variant, geo=args.geo, config=cfg)
             if args.syncseal:
                 method = SyncWrapped(method, dev)

@@ -37,7 +37,8 @@ class PWL:
         return y, cons
 
 class Surrogate:
-    def __init__(self, fragments, attacks, ranges, base, delta, d, e, cap=None, frontend=None):
+    def __init__(self, fragments, attacks, ranges, base, delta, d, e, cap=None, frontend=None,
+                 latency=None):
         self.fragments=list(fragments); self.attacks=list(attacks); self._ranges=dict(ranges)
         self._base=base; self._delta=delta; self._d=d; self._e=e   # dict-keyed PWLs
         # OPTIONAL measured extras (absent in older tables, so every accessor returns None instead
@@ -45,7 +46,89 @@ class Surrogate:
         #   cap[(f,a)]      reliable-bit capacity (bits) as a PWL in f's native strength
         #   frontend[key]   front-end curves, e.g. "nested_penalty" (MSE vs s_VINE),
         #                   "base_nested_VINE|crop75", "base_resync_TrustMark|rot9"
+        #   latency[key]    per-stage wall time in ms, e.g. "latency_ms_angle|rot9" -- a scalar,
+        #                   not a function of strength, so it is kept out of the curve blocks
+        #                   (a float placed in one is silently dropped when the table is loaded)
         self._cap=dict(cap or {}); self._frontend=dict(frontend or {})
+        self._latency=dict(latency or {})
+    # ---- request-scoped refinement -------------------------------------------------------------
+    # A live measurement lands at ONE strength, but the solver reads a curve. Patching only that point
+    # would let the next round step to s+eps and read the un-patched, optimistic value, so the loop
+    # would never converge. The measurement is therefore applied as an OFFSET to the whole curve: the
+    # shape stays, the level moves by however much reality disagreed. That also matches how the error
+    # behaves -- the held-out validation found the discrepancy roughly level across strength rather
+    # than concentrated at a point.
+    @staticmethod
+    def fe_key(stage, f, a):
+        """The replacement curve the solver reads for fragment f under attack a with `stage` on."""
+        return f"base_fe_{stage}_{f}|{a}"
+
+    def with_live(self, offsets):
+        """A copy whose curves are shifted by `offsets`.
+
+        Keys are (frag, attack) for the plain curve or ("fe", stage, frag, attack) for the replacement
+        curve of a front-end stage. The second form exists because a configuration with a front-end on
+        is solved against the replacement curve, so a contradiction measured on it has to move THAT
+        curve: shifting only the plain curve left the next solve reading the same optimistic value and
+        the loop re-proposing the same configuration until its round budget ran out."""
+        import copy as _c
+        sg = _c.copy(self)
+        sg._base = dict(self._base); sg._frontend = dict(self._frontend)
+        for key, d in (offsets or {}).items():
+            if abs(d) < 1e-12:
+                continue
+            if len(key) == 4 and key[0] == "fe":
+                name = self.fe_key(*key[1:]); c = self._frontend.get(name)
+                if c is not None:
+                    sg._frontend[name] = PWL(list(c.xs), [min(1.0, max(0.0, y + d)) for y in c.ys])
+            else:
+                c = self._base.get(tuple(key))
+                if c is not None:
+                    sg._base[tuple(key)] = PWL(list(c.xs), [min(1.0, max(0.0, y + d)) for y in c.ys])
+        return sg
+
+    def live_offset(self, f, a, strength, measured, se_live=None, se_table=None,
+                    prior_sd=None, k=2.0, asymmetric=True, fe=None):
+        """The offset a live measurement implies, taking both sides' uncertainty seriously.
+
+        Treating the live mean as ground truth is wrong twice over. It is itself an estimate -- at ten
+        images its standard error is about 0.015, so a disagreement of 0.02 is barely more than noise --
+        and the table it overrides was measured on a hundred, making it the more precise of the two. A
+        raw overwrite therefore lets sampling noise rewrite a better-measured number.
+
+        Three corrections, in order:
+
+        gate       nothing is patched unless the disagreement exceeds k standard errors of the live
+                   measurement. Below that the two are consistent and there is nothing to explain.
+        shrinkage  what survives the gate is not applied whole. The live measurement and the table
+                   estimate different things -- this user's images versus the pool -- so the question is
+                   how much of the gap is a real distribution difference rather than sampling. With a
+                   prior width for that difference the posterior mean shrinks the gap by
+                   prior^2 / (prior^2 + se_live^2), which is close to the full gap when the live
+                   measurement is precise and close to zero when it is not.
+        asymmetry  a gap in the pessimistic direction is applied as computed; an optimistic one is
+                   damped further. Over-correcting downward costs fidelity, over-correcting upward
+                   manufactures a false SAT, and only the second is a safety failure.
+
+        Returns 0.0 when the disagreement does not survive the gate. `fe` names the front-end stage
+        whose replacement curve the solver read for this cell; the gap is then measured against it.
+        """
+        c = self._frontend.get(self.fe_key(fe, f, a)) if fe else None
+        if c is None:
+            c = self._base.get((f, a))
+        if c is None:
+            return 0.0
+        gap = float(measured) - float(c.eval(strength))
+        if se_live is None:                       # no uncertainty supplied -> behave as a raw overwrite
+            return gap
+        if abs(gap) < k * float(se_live):         # indistinguishable from sampling noise
+            return 0.0
+        p2 = float(prior_sd) ** 2 if prior_sd else float("inf")
+        w = 1.0 if p2 == float("inf") else p2 / (p2 + float(se_live) ** 2)
+        if asymmetric and gap > 0:                # reality better than the table: damp harder
+            w *= 0.5
+        return gap * w
+
     def range(self,f): return self._ranges[f]
     def base(self,f,a): return self._base[(f,a)]
     def delta(self,g,f,a): return self._delta[(g,f,a)]
@@ -54,6 +137,7 @@ class Surrogate:
     def cap(self,f,a): return self._cap.get((f,a))          # None when not measured
     def has_cap(self): return bool(self._cap)
     def frontend(self,key): return self._frontend.get(key)  # None when not measured
+    def latency(self,key): return self._latency.get(key)    # ms, None when not measured
     def to_dict(self):
         pk=lambda p:{"xs":p.xs,"ys":p.ys}
         return {"fragments":self.fragments,"attacks":self.attacks,"ranges":self._ranges,
@@ -62,7 +146,8 @@ class Surrogate:
                 "d":{f:pk(self._d[f]) for f in self._d},
                 "e":{f"{p[0]}|{p[1]}":pk(self._e[p]) for p in self._e},
                 **({"cap":{f"{f}|{a}":pk(self._cap[(f,a)]) for (f,a) in self._cap}} if self._cap else {}),
-                **({"frontend":{k:pk(v) for k,v in self._frontend.items()}} if self._frontend else {})}
+                **({"frontend":{k:pk(v) for k,v in self._frontend.items()}} if self._frontend else {}),
+                **({"latency":dict(self._latency)} if self._latency else {})}
     @staticmethod
     def from_dict(dd):
         mk=lambda o:PWL(o["xs"],o["ys"])
@@ -75,8 +160,10 @@ class Surrogate:
              if isinstance(v,dict) and "xs" in v}
         frontend={k:mk(v) for k,v in (dd.get("frontend") or {}).items()
                   if isinstance(v,dict) and "xs" in v}
+        latency={k:float(v) for k,v in (dd.get("latency") or {}).items()
+                 if isinstance(v,(int,float))}
         return Surrogate(dd["fragments"],dd["attacks"],dd["ranges"],base,delta,d,e,
-                         cap=cap, frontend=frontend)
+                         cap=cap, frontend=frontend, latency=latency)
 
 def synthetic_surrogate(fragments=("VINE","TrustMark","VideoSeal"), attacks=tuple(PHASE1_ATTACKS)):
     import numpy as np
