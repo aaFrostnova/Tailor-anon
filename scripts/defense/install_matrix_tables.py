@@ -11,12 +11,12 @@ main_tab, qual_tab = tabs
 
 MAIN = r"""\begin{table}[h]
 \centering
-\caption{\textbf{Main result --- robustness at a fixed operating point (Mode M1).} Bit accuracy
+\caption{\textbf{Main result: robustness at a fixed operating point (Mode M1).} Bit accuracy
 ($\uparrow$; $0.5$ = payload destroyed) after each attack. Rows are post-hoc watermarks decoded under a
 common protocol: each method carries its own native payload (\emph{bits}) and is declared detected at
 its own $1\%$-FPR binomial threshold, so the false-positive rate is matched across rows while payload
 length is not. Columns follow the RAVEN attack suite (\S\ref{sec:attack-baselines}); every number is
-measured by us --- none is transcribed from prior work. $N{=}200$ images drawn across the five-source
+measured by us; none is transcribed from prior work. $N{=}200$ images drawn across the five-source
 pool (\S\ref{sec:datasets}); $N{=}30$ for Edit and I2V, $N{=}20$ for CtrlRegen$+$, which runs in a
 separate environment. \textbf{Ours} is the composite pinned at one operating point with its
 \emph{geometric front-ends disabled}, so every row here is decoded without resynchronization; the
@@ -37,8 +37,8 @@ QUAL = r"""\begin{table}[h]
 \centering
 \caption{\textbf{Fidelity and mean detection} for the rows of Table~\ref{tab:main}, measured on the
 same images. PSNR/SSIM are of the watermarked image against its cover; mean TPR@$1\%$FPR averages
-over the attacked columns. The composite buys its robustness with fidelity --- it is the lowest-PSNR
-row here --- which is why M1 alone is not a fair summary of an adaptive scheme and why
+over the attacked columns. The composite buys its robustness with fidelity (it is the lowest-PSNR
+row here), which is why M1 alone is not a fair summary of an adaptive scheme and why
 \S\ref{sec:solver-eval} reports the fidelity the solver actually delivers per request. Best per column
 in \textbf{bold}.}
 \label{tab:main-quality}
