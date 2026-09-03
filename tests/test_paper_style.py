@@ -5,6 +5,8 @@
    compounds with a hyphen, table placeholders as n/a.
 2. A link (\\url, \\href, a bare http URL) may appear only inside a footnote (\\footnote or
    \\tablefootnote) or in the bibliography; never inline in prose, captions or table cells.
+3. A footnote link points at code or data (a repository, a package, a project page), never at a paper:
+   published work is cited from the bibliography, so no arXiv or DOI URL may appear in a footnote.
 
 The check strips LaTeX comments first, so a commented-out line does not count. It runs over every
 source the paper inputs: main.tex, src/, tab/, figtex/.
@@ -50,3 +52,26 @@ def test_links_only_in_footnotes():
             if link.search(rest):
                 hits.append(f"{_rel(p)}:{i}: {line.strip()[:90]}")
     assert not hits, "links outside footnotes:\n" + "\n".join(hits)
+
+
+def test_papers_are_cited_not_footnoted():
+    """arXiv and DOI links belong in the bibliography, not in a footnote."""
+    bad = re.compile(r"arxiv\.org|doi\.org|/doi/|dx\.doi")
+    hits = [f"{_rel(p)}:{i}: {line.strip()[:90]}" for p in FILES for i, line in _stripped(p)
+            if bad.search(line)]
+    assert not hits, "paper links in the sources; cite them instead:\n" + "\n".join(hits)
+
+
+def test_bibliography_is_enabled_and_every_key_resolves():
+    """The paper prints a reference list, and every \\cite key exists in the bib."""
+    main = open(os.path.join(PAPER, "main.tex"), encoding="utf-8").read()
+    assert re.search(r"^\s*\\bibliography\{", main, re.M), "main.tex does not print a bibliography"
+    bib = open(os.path.join(PAPER, "iclr2027_conference.bib"), encoding="utf-8").read()
+    defined = set(re.findall(r"@\w+\{([^,]+),", bib))
+    used = set()
+    for p in FILES:
+        for _, line in _stripped(p):
+            for group in re.findall(r"\\cite[a-z]*\*?(?:\[[^\]]*\])*\{([^}]*)\}", line):
+                used |= {k.strip() for k in group.split(",") if k.strip()}
+    assert used, "the paper cites nothing"
+    assert not (used - defined), f"cited but not in the bib: {sorted(used - defined)}"
