@@ -106,3 +106,20 @@ solver revisions applied to solved shards without re-drawing), `bestpath_vs_fuse
 `environment.yaml` / `requirements.txt` describe the `fingerprint` environment (torch, z3-solver, diffusers,
 the VINE, TrustMark, VideoSeal and SyncSeal checkouts under `external/`, see `CODE_MAP.md`). CtrlRegen+ and
 UnMarker run in their own environments: `scripts/attack/setup_ctrlregen.sh`, `scripts/attack/setup_unmarker.sh`.
+
+## Known limitations of the reported runs
+
+- The interference table (`delta`, 120 cells) is measured on the plain embeds only: it has no front-end
+  dimension. A two-view re-measurement of the ring with a partner fragment (crop50, VINE 0.93 on the
+  cascade view against 0.92 in the table) shows no error from this today, but a stage that changes the
+  embed is not re-measured against every partner.
+- UnMarker's table cells are a search prior measured on 30 images; the column is judged live only.
+- Every curve is measured at 512 x 512; the solver refuses other resolutions until a table exists for them.
+- The deployed decoder's presence test runs at a fixed 1 percent budget (`presence_detected`); the request's
+  budget enters the solver and the verdicts (which re-threshold the recorded reads per request), not the
+  decoder's own verdict, and the fused zero-bit test costs every two-fragment configuration one bit of
+  threshold while adding almost no detections (the fused keyed verification is what helps, on 1 to 3 percent
+  of images on the diffusion columns).
+- The per-image acceptance floor and the capacity line carry margins (0.96 in the table for a 0.90
+  deployed floor, +0.02 on the capacity line) from the margin run on; the archived no-margin run shows
+  what happens without them (live rates 0.80 to 0.89 where the table said 0.90).
