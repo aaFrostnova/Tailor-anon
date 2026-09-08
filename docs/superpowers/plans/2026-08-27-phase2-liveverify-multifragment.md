@@ -15,7 +15,7 @@
 - Native strength knobs (Phase 1): VINE residual-scale, TrustMark `WM_STRENGTH`, VideoSeal `blender.scaling_w`, all via `embed_with_target(pil, target, strength=<float>)`.
 - The Phase-1 base `surrogate_table.json` is immutable; regen data is added as a separate `regen_overlay` block / file.
 - Phase-1's 79 tests must keep passing.
-- GPU via sbatch; regen via the `ctrlregen` env. `$PYFP`=/home/mingzhel_umass_edu/.conda/envs/fingerprint/bin/python. HF token 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.
+- GPU via sbatch; regen via the `ctrlregen` env. `$PYFP`=/home/mingzhel_umass_edu/.conda/envs/fingerprint/bin/python. HF token <HF_TOKEN>.
 
 ---
 

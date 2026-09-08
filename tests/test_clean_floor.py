@@ -47,12 +47,20 @@ def _sg():
 
 
 def _solve(sg, **kw):
+    """The smallest strength the floor still admits.
+
+    The curve here is flat, so every strength in range satisfies coverage and a bare `check()` may
+    return any of them: z3's model choice is not deterministic on this encoding, which is the whole
+    reason the solver certifies its optimum instead of trusting one `check()`. Minimising the strength
+    makes the answer well defined, and it is the quantity the floor is supposed to bound.
+    """
     o, u, *_ = W.build(min_psnr=0.0, max_ms=1e9, attacks=list(ATTACKS), min_ba=0.9,
                        allow_resync=False, allow_nested=False, min_bits=0, enable_order=True,
-                       continuous_strength=True, surrogate=sg, **kw)
+                       continuous_strength=True, surrogate=sg, margin=0.0, **kw)
     o.add(u["TrustMark"])
     for f in u:
         if f != "TrustMark": o.add(z3.Not(u[f]))
+    o.minimize(o._svars["TrustMark"])
     assert o.check() == z3.sat
     m = o.model()
     v = m.eval(o._svars["TrustMark"], model_completion=True)

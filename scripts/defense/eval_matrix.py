@@ -190,7 +190,6 @@ class OursComposite:
         if self.geo:
             from composite_external_eval import scale_resid, nested_vine_embed, rot
             from src.syncseal_frontend import load_sync, sync_embed, sync_rectify
-            from src.fusion_head3 import load_head3, head3_llr
             self._scale_resid, self._nested, self._rot = scale_resid, nested_vine_embed, rot
             self._sync_embed, self._sync_rectify = sync_embed, sync_rectify
             # The SyncSeal model is only needed by the resync stage. A config that asks only for the
@@ -201,9 +200,7 @@ class OursComposite:
                 self._tiled = TiledTrustMark(self.frag["trustmark"], self.sb)
             else:
                 self._tiled = None
-            h3 = os.path.join(REPO, "results/defense/frag3_head.pt")
-            self._head3 = load_head3(h3, dev) if os.path.exists(h3) else None
-            self._head3_llr = head3_llr
+            self._head3 = None                              # learned head retired; see decode()
             self._rr, self._rs, self._vss, self._bc, self._bg = 180.0, 3.0, 0.005, 10.0, 0.60  # geo search params
 
     def secret_for(self, idx):
@@ -303,10 +300,11 @@ class OursComposite:
         for name in self.order:
             a = self._frag_llr(name, att, image_id); aligned[name] = a
             if decode_and_verify(a, image_id, codec=self.sb)["detected"]: bestpath = True
-        if self.geo and self._head3 is not None and len(aligned) == 3:
-            fused = self._head3_llr(self._head3, aligned["vine"], aligned["trustmark"], aligned["videoseal"], self.dev)
-        else:
-            fused = fuse_llrs(aligned, weights=None, n_codeword=self.sb.n)
+        # Equal-weight fusion for every configuration. A learned head over the three fragments' LLRs
+        # used to take over here when all three were selected with a front-end on; it fired on 49 of
+        # 8,575 solved requests and was measured at +0.4 points, and it was the pipeline's only learned
+        # component. Removed so that every number in the evaluation comes from the same decoder.
+        fused = fuse_llrs(aligned, weights=None, n_codeword=self.sb.n)
         fba = float(np.mean(llr_to_bits(fused) == tx))
         fver = bool(decode_and_verify(fused, image_id, codec=self.sb)["detected"])
         # Presence is best-path as well: one live fragment fires the zero-bit test even when a dead

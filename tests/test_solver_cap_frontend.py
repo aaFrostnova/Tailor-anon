@@ -1,7 +1,7 @@
-"""The continuous path must honour the measured capacity curves and the measured front-end curves.
+"""The continuous path must honour the capacity derived from bit accuracy and the measured front-end curves.
 
 These use a SYNTHETIC surrogate so they pin the mechanism rather than any particular measurement:
-a capacity curve that rises with strength must be able to force a stronger (or different) config,
+a payload the low end of the bit-accuracy curve cannot carry must force a stronger (or different) config,
 and a front-end curve that is WORSE than its no-front-end control must let the solver decline that
 front-end rather than being assumed to help.
 """
@@ -43,15 +43,20 @@ def _solve(sg, attacks, min_ba=0.60, min_bits=0, allow_resync=True, force=(), fo
             "resync": str(m.eval(rs)) == "True"}
 
 
-def test_capacity_curve_forces_a_stronger_config():
-    """A capacity floor the low end of the curve cannot meet must push the solve up the curve."""
+def test_capacity_floor_forces_a_stronger_config():
+    """A payload the low end of the bit-accuracy curve cannot carry must push the solve up the curve.
+
+    Capacity is derived from bit accuracy (W.ba_to_bits): 0.60 carries 3 bits, 0.98 carries 86, so a
+    70-bit payload (0.94 plus the request's 0.02 margin) is met only near the top of the range and a
+    95-bit one (0.994) nowhere."""
     lo, hi = synthetic_surrogate().range("VINE")
-    cap = {("VINE", a): PWL([lo, hi], [10.0, 90.0]) for a in ATTACKS}
-    sg = _surrogate(cap=cap)
+    sg = _surrogate()
+    sg._base[("VINE", "jpeg25")] = PWL([lo, hi], [0.60, 0.98])
     free = _solve(sg, ["jpeg25"], force=("VINE",), forbid=("TrustMark", "VideoSeal"))
-    tight = _solve(sg, ["jpeg25"], min_bits=80, force=("VINE",), forbid=("TrustMark", "VideoSeal"))
+    tight = _solve(sg, ["jpeg25"], min_bits=70, force=("VINE",), forbid=("TrustMark", "VideoSeal"))
     assert free is not None and tight is not None
     assert tight["s"]["VINE"] > free["s"]["VINE"], "capacity floor did not raise the strength"
+    assert sg.base("VINE", "jpeg25").eval(tight["s"]["VINE"]) >= W.bits_to_ba(70) + W.DEFAULT_MARGIN - 1e-6
     # and a floor above the whole curve is infeasible, not silently ignored
     assert _solve(sg, ["jpeg25"], min_bits=95, force=("VINE",),
                   forbid=("TrustMark", "VideoSeal")) is None

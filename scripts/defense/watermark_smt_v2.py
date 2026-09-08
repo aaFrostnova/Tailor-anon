@@ -5,7 +5,7 @@
  - Pareto mode (--pareto): enumerate quality/robustness/speed trade-offs instead of one lexicographic pick.
 Regen/rinse/rot/crop bit-acc for VINE/TM come from frag_suite (n=20) + memory (regen 0.92/0.80, TM regen dead).
 """
-import json, sys, argparse
+import json, sys, argparse, math
 from z3 import (Optimize, Bool, Int, Real, If, Or, And, Not, Implies, Sum, BoolVal, sat, is_true,
                 AtMost)
 CF="/work/pi_shiqingma_umass_edu/mingzheli/cryptographic_fingerprint"
@@ -94,7 +94,7 @@ UNMK_CAP_VINE=37.0
 # n=24) plus hand-patched blocks. Replace every VALUE with the freshly-measured, provenance-stamped
 # baseline_table.json (100% coverage, std attached). The structures (F, ALPHA, CAP, PSNR_SOLO,
 # penalties, latency) are kept; only the numbers change, so the rest of the solver is untouched.
-# BA_STD (per-cell image-to-image std) is exposed for the variance-aware live_required() gate.
+# Per-cell image-to-image std for the live gate now comes from ba_sd_profile.json (BA_SD_COL).
 import json as _bjson, os as _bos
 _BLP = "/scratch/workspace/mingzhel_umass_edu-ablator/wm_dataset10k/baseline_table.json"
 BASELINE_PROVENANCE = None
@@ -132,15 +132,78 @@ if _bos.path.exists(_BLP):
     _rs = _bv("frontend", "resync_ms"); _ns = _bv("frontend", "nested_ms")
     FE_MS = {"resync": (_rs if _rs is not None else 300.0), "nested": (_ns if _ns is not None else 1600.0)}
     # --- per-cell std for the variance gate ---
-    BA_STD_FRESH = {}
-    for k, c in _C["bit_acc"].items():
-        if isinstance(c, dict) and "std" in c:
-            f = k.split("@")[0]; at = k.split("/")[-1]; BA_STD_FRESH[(f, at)] = c["std"]
+    # BA_STD_FRESH (per-cell std for the retired live_required gate) moved to the attic with it.
 else:
     FE_MS = {"resync": 300.0, "nested": 1600.0}
     BASELINE_PROVENANCE = {"warning": "baseline_table.json NOT FOUND -- using inherited smt_inputs values"}
 
 CAP_UNMEASURED=set()   # all 11 SMT attacks now measured (rot/vae/rinse via hidden_ext N=1000)
+# The 9-knot diffusion campaign renamed three columns the capacity measurements still carry under their
+# old names, and a capacity cell that matches nothing drops out of the clause entirely rather than
+# binding: a 90-bit identity under `rinse2x` came back SAT while the same request under `regen`, whose
+# capacity is known (80.9 bit), is correctly UNSAT. `rinse` was measured as the double regeneration that
+# `rinse2x` names, so that one is an alias. `rinse4x` and `ctrlregen_s05_x2` are strictly stronger than
+# anything measured, and capacity falls with attack strength, so borrowing the weaker column's number
+# would credit bits nobody measured; they take 0 until measured, which is the same rule the table already
+# applies to VideoSeal under UnMarker.
+CAP_ALIAS = {"rinse2x": "rinse"}
+CAP_UNMEASURED_ZERO = {"rinse4x", "ctrlregen_s05_x2"}
+
+
+def cap_constant(frag, attack):
+    """Measured reliable-bit capacity for a cell, or None when nothing was measured for it.
+
+    Returns 0.0 for a column known to be strictly harder than the hardest measured one: unmeasured
+    capacity is never credited, and a request that needs bits there is infeasible rather than silently
+    unconstrained."""
+    tbl = CAP.get(frag, {})
+    if attack in tbl:
+        return tbl[attack]
+    alias = CAP_ALIAS.get(attack)
+    if alias is not None and alias in tbl:
+        return tbl[alias]
+    if attack in CAP_UNMEASURED_ZERO:
+        return 0.0
+    return None
+NATIVE_BITS = 100   # every fragment carries the same 100-bit BCH codeword
+
+
+def _h2(p):
+    """Binary entropy in bits, exactly 0 at the endpoints."""
+    p = float(p)
+    if p <= 0.0 or p >= 1.0: return 0.0
+    return -p * math.log2(p) - (1.0 - p) * math.log2(1.0 - p)
+
+
+def ba_to_bits(ba, n=NATIVE_BITS):
+    """Reliable bits a fragment carries at mean bit accuracy `ba`: the binary-symmetric-channel bound
+    n(1 - H(1 - ba)) of its n-bit codeword, zero at or below chance.
+
+    This is what a bit-accuracy measurement can say about capacity, and it is the capacity the solver
+    uses (see the capacity clause in add_strength_order). Checked against the measured soft-information
+    capacity curves at all 244 knots of the 42 measured cells (capacity_bound_check.json): for every
+    payload size up to 77 bits, no knot where the measurement refuses the payload has the bound granting
+    it (the bound sits a median 7 bits below the measurement, the soft-decoding gain); the only excesses
+    are +0.3 bits at 78 bits and up to +3.9 bits at saturation, where the soft estimator tops out at 96.
+    Requests ask for at most 50 bits."""
+    ba = float(ba)
+    return 0.0 if ba <= 0.5 else n * (1.0 - _h2(1.0 - ba))
+
+
+def bits_to_ba(bits, n=NATIVE_BITS):
+    """The mean bit accuracy at which ba_to_bits reaches `bits`: 0.5 at or below zero bits, 1.0 at n
+    bits or more. A payload constraint `capacity >= bits` is the strength condition `ba >= bits_to_ba(bits)`."""
+    bits = float(bits)
+    if bits <= 0.0: return 0.5
+    if bits >= n: return 1.0
+    lo, hi = 0.5, 1.0
+    for _ in range(60):
+        mid = 0.5 * (lo + hi)
+        if ba_to_bits(mid, n) < bits: lo = mid
+        else: hi = mid
+    return hi
+
+
 def achievable_bits(chosen, attacks, resync=False, nested=False):
     def eff(f,a):   # mirror the constraint's front-end capacity recovery
         c=CAP[f].get(a,0.0)
@@ -305,22 +368,10 @@ def assert_baseline_intact():
 ADVERSARIAL = {"unmarker"}                 # per-image optimised -> mean is never the point estimate
 # Diffusion-family attacks are stochastic (per-image regeneration) and were measured at small n, so a
 # point estimate that sits near theta must not decide feasibility alone -> give them a conservative
-# default std so live_required() fires near the threshold even where variance_profile did not cover them.
+# default std so live_required_at() fires near the threshold where ba_sd_profile has no entry.
 DIFFUSION = {"regen", "rinse", "ctrlregen", "ctrlregen_s03", "ctrlregen_s05", "ctrlregen_s07"}
 DEFAULT_STD_DIFFUSION = 0.08
-BA_STD = {}                                # populated below from BA_STD_FRESH (baseline) or variance_profile.json
-try:
-    import json as _json, os as _os
-    _vp = "/scratch/workspace/mingzhel_umass_edu-ablator/wm_dataset10k/variance_profile.json"
-    if _os.path.exists(_vp):
-        for _k, _v in _json.load(open(_vp)).items():
-            BA_STD[tuple(_k.split("/"))] = _v.get("std", 0.0)
-except Exception:
-    pass
-try:
-    BA_STD.update(BA_STD_FRESH)     # prefer the baseline's per-cell std
-except NameError:
-    pass
+# BA_STD (variance_profile.json) served only the retired live_required(); the gate in force reads BA_SD_COL.
 # Clean-image floors (follow-up item 3). `measure_clean_minimum.py` sweeps each fragment on unattacked
 # images and records, per strength, the mean/sd of the hard bit accuracy and the fraction of images that
 # clear the presence level; below the floor a fragment cannot be read reliably even before any attack,
@@ -357,18 +408,75 @@ def clean_floors(min_ba, min_bits=0, levels=None):
                                                   (_CLEAN_IDENTITY_BA - _CLEAN_PRESENCE_TAU)))
     return {f: round(p + t * (i - p), 4) for f, (p, i) in levels.items()}
 
-def live_required(attack, frags, min_ba, k=2.0):
-    """True if the offline table cannot settle this (attack, config, threshold) -> measure on the user's image."""
-    if attack in ADVERSARIAL: return True, "adversarial (per-image worst-case)"
-    def _sd(f):
-        if (f, attack) in BA_STD: return BA_STD[(f, attack)]
-        return DEFAULT_STD_DIFFUSION if attack in DIFFUSION else None
-    cand = [(BA_full(f, attack), _sd(f)) for f in frags if _sd(f) is not None]
-    if not cand: return False, "no variance data"
-    mean, sd = max(cand, key=lambda ms: ms[0])
-    if abs(mean - min_ba) < k * sd:
-        return True, f"near-threshold: |{mean:.2f}-{min_ba:.2f}| < {k}*{sd:.2f}"
-    return False, "table mean is >2 std from threshold"
+# A certified optimum sits exactly ON the binding constraint: the solver spends no strength it does not
+# have to, so the configuration it returns is predicted to clear the threshold by nothing at all. The
+# table's curve is a mean over 100 images and a deployment reads one image, so half the live samples of a
+# cell that predicts exactly the threshold land below it. Measured on 60 certified requests against 50
+# unseen cross-source images each: with no allowance, 7 of 59 configurations missed the requirement, every
+# one of them by 0.002 to 0.005, inside one standard error of the live mean (median 0.0074). An allowance
+# of two standard errors removes all seven and turns 4 of the 60 requests infeasible; 0.05 costs 9 more
+# infeasible requests and prevents nothing further. The allowance does not make the prediction better (the
+# error is 0.004 at every setting) -- it moves the line the optimum sits on.
+DEFAULT_MARGIN = 0.02
+
+
+# live_required() (the legacy gate at a fixed operating point) is retired: see attic/repo/scripts/defense/
+# retired_from_watermark_smt_v2.py. live_required_at() below is the gate in force.
+
+
+# Per-column image-to-image SD, measured (ba_sd_profile.json: sd = se*sqrt(n) pooled over the certified
+# configurations, plus the ring campaign's per-knot spread on the columns the scale stage replaces).
+# variance_profile.json covered 14 classical columns at one fixed operating point; the gate below has to
+# answer for every column a request can name, and the widest spreads are exactly the columns the offline
+# mean settles least well: crop_jpeg 0.133, crop50 0.112, regen 0.097, rinse2x 0.098, unmarker 0.084
+# (0.228 at the ring curve's widest knot). A key may be qualified by the front-end stage the solve read,
+# because the stage changes the embed and with it the spread.
+BA_SD_COL = {}
+try:
+    _sdp = _bos.environ.get("BA_SD_PROFILE",
+                            "/scratch/workspace/mingzhel_umass_edu-ablator/wm_dataset10k/ba_sd_profile.json")
+    if _bos.path.exists(_sdp):
+        for _k, _v in _bjson.load(open(_sdp)).items():
+            BA_SD_COL[_k] = float(_v.get("sd", 0.0))
+except Exception:
+    pass
+
+
+def live_required_at(attack, table_value, threshold, sd=None, k=2.0, stage=None):
+    """Whether the OFFLINE TABLE may settle this (attack, configuration, threshold), or a live
+    measurement on the user's own image must.
+
+    The retired live_required() answered the same question from a fixed operating point (BA_full), which
+    is not the number a request's verdict rests on. This takes `table_value`: what the solve actually
+    read for the configuration it returned, under the front-end stage it turned on. Two reasons to
+    refuse the table:
+
+      adversarial      UnMarker optimises against the image in front of it, so the offline mean is the
+                       attacker's success rate on OTHER images. Measured on the certified C4 requests:
+                       four of nine cleared the mean threshold with per-image detection 0.30 to 0.80,
+                       i.e. the request passed while most single images did not.
+      near-threshold   a certified optimum sits ON the constraint, so when the table value is within
+                       k image-to-image standard deviations of the threshold the specific image can land
+                       on either side. Measured: of the cells that clear the mean, 9% of the benign ones
+                       have per-image detection below 0.90, against 52% of the diffusion ones.
+
+    Returns (required, reason). The caller decides what to do with a required cell it cannot execute:
+    a verdict that says the table settled it would be the failure this gate exists to prevent.
+    """
+    if attack in ADVERSARIAL:
+        return True, "adversarial (per-image worst-case; the offline mean is the attacker's score on other images)"
+    if sd is None:
+        for key in ((f"{attack}@{stage}",) if stage else ()) + (attack,):
+            if key in BA_SD_COL and BA_SD_COL[key] > 0:
+                sd = BA_SD_COL[key]; break
+    if sd is None and attack in DIFFUSION:
+        sd = DEFAULT_STD_DIFFUSION
+    if not sd or sd <= 0:
+        return False, "no variance data"
+    gap = abs(float(table_value) - float(threshold))
+    if gap < k * sd:
+        return True, f"near-threshold: |{table_value:.3f}-{threshold:.3f}|={gap:.3f} < {k}*{sd:.3f}"
+    return False, f"table value is more than {k} sd from the threshold"
 
 RES_MEASURED = {256, 512, 1024, 2048}
 _GEOM = {"crop90", "crop75", "crop50", "rot9", "rot30"}
@@ -390,9 +498,23 @@ def _check_resolution(res, attacks=()):
             f"resolution: {sorted(ok)}. The diffusion/adversarial family was measured only at 512, and "
             f"signal/VAE cells do not transfer to 256. Measure those cells or pass resolution=512.")
 
+# Per-image acceptance floor (see eff_det in add_strength_order): a selected fragment must clear the
+# request's threshold on at least this fraction of the measured images, not only on average. On by
+# default (user 2026-09-06); det_min=0 restores the mean-only clause.
+DEFAULT_DET_MIN = 0.90
+# Margin on that floor (2026-09-08). The floor is a rate estimated from the table's images, and the optimum sits
+# exactly on it, so on fresh images the rate falls below it half the time: in the class certification every
+# failing cell read 0.80..0.89 live where the table said 0.90..0.94, with the table's means accurate to 0.001.
+# The solver therefore asks the TABLE for det_min + DEFAULT_RATE_MARGIN so that the DEPLOYED floor det_min
+# holds on new images: two standard errors of a rate near 0.9 estimated from 100 images. The capacity line
+# gets the request's mean margin (DEFAULT_MARGIN) for the same reason (334 C3 requests missed it live by a
+# median 0.004). Both are charged where the floor binds and nowhere else.
+DEFAULT_RATE_MARGIN = 0.06
+
+
 def build(min_psnr,max_ms,attacks,min_ba,allow_resync,allow_nested,min_bits=0,resolution=512,
-          enable_order=False,continuous_strength=False,surrogate=None,margin=0.0,clean_floor=None,
-          fe_gain_min=0.05):
+          enable_order=False,continuous_strength=False,surrogate=None,margin=DEFAULT_MARGIN,clean_floor=None,
+          fe_gain_min=0.05, pair_min_cascade=0.02, det_min=DEFAULT_DET_MIN, rate_margin=DEFAULT_RATE_MARGIN):
     _check_resolution(resolution, attacks)
     surrogate_mode = (enable_order or continuous_strength) and surrogate is not None
     opt=Optimize()
@@ -488,7 +610,8 @@ def build(min_psnr,max_ms,attacks,min_ba,allow_resync,allow_nested,min_bits=0,re
         s_vars, p_vars, psnr_expr = add_strength_order(opt, use, attacks, surrogate, min_ba, enable_order,
                                                resync=resync, nested=nested, min_bits=min_bits,
                                                min_psnr=min_psnr, frontends=FEV, margin=margin,
-                                               clean_floor=clean_floor, fe_gain_min=fe_gain_min)
+                                               clean_floor=clean_floor, fe_gain_min=fe_gain_min,
+                                               pair_min_cascade=pair_min_cascade, det_min=det_min, rate_margin=rate_margin)
         psnr = psnr_expr          # override the discrete-PSNR expression with the surrogate PSNR
         opt._svars = s_vars; opt._pvars = p_vars    # expose for callers/tests
         opt._fevars = FEV                            # the front-end decisions, one per cascade stage
@@ -584,8 +707,9 @@ def frontend_config(fe):
 
 
 def add_strength_order(opt, u, sel_attacks, surrogate, min_ba, order,
-                       resync=None, nested=None, min_bits=0, min_psnr=None, frontends=None, margin=0.0,
-                       clean_floor=None, fe_gain_min=0.05):
+                       resync=None, nested=None, min_bits=0, min_psnr=None, frontends=None, margin=DEFAULT_MARGIN,
+                       clean_floor=None, fe_gain_min=0.05, pair_min_cascade=0.02, det_min=DEFAULT_DET_MIN,
+                       rate_margin=DEFAULT_RATE_MARGIN):
     import z3
     assert set(surrogate.fragments) <= set(u.keys()), "surrogate fragments must be a subset of the solver's fragment vars"
     # One decision variable per separately selectable geometric front-end. `resync` and `nested`
@@ -690,10 +814,29 @@ def add_strength_order(opt, u, sel_attacks, surrogate, min_ba, order,
             # partner's mid strength) and the stage on, on the columns the stage is responsible for.
             # Where it exists and the partner is selected after the host, it is the level -- it already
             # contains the partner's interference, so the delta term for that pair is dropped below.
+            #
+            # It is the level only where the CASCADE ACTUALLY RAN. The deployed decoder skips the
+            # cascade whenever the composite already verifies on the primary view, and in a two-fragment
+            # composite the PARTNER can be what verifies: the host is then read on the un-rectified view
+            # and the curve records a short-circuit rather than the host's capability. Measured: tiled
+            # VINE with TrustMark written over it reads 0.49 on crop75 where VINE alone with the ring
+            # search reads 0.91, and the control curve (same embed, cascade suppressed) is 0.49 too, so
+            # nothing was measured about VINE under the ring there -- TrustMark simply answered first.
+            # Using such a curve as the level would tell the solver a fragment loses a column it never
+            # had to defend, and can force a false UNSAT on a request the partner alone cannot meet.
+            # The control curve separates the two cases: where the deployed read beats the suppressed
+            # one the cascade contributed and the pair curve is an end-to-end measurement (TrustMark
+            # under VideoSeal on crop50: 0.59 suppressed, 0.74 deployed, against 0.88 solo, real
+            # interference); where it does not, fall back to the single-fragment curve minus delta.
             for g in FRs:
                 if g == f: continue
                 c_pair = surrogate.frontend(f"base_fe_{cname}_{f}|{a}|with_{g}")
                 if c_pair is None: continue
+                c_ctrl = surrogate.frontend(f"ctrl_pair_{f}|{a}|with_{g}")
+                if c_ctrl is not None:
+                    grid_p = sorted(set(c_pair.xs) | set(c_ctrl.xs))
+                    if max(c_pair.eval(x) - c_ctrl.eval(x) for x in grid_p) < pair_min_cascade:
+                        continue                      # cascade never contributed: not informative
                 pe_, pc_ = c_pair.add_to_z3(s[f], f"fepair_{cname}_{f}_{g}_{a}"); cons = cons + pc_
                 use_pair = z3.And(cvar, after_of(f, g))
                 on_e = z3.If(use_pair, pe_, on_e)
@@ -731,6 +874,92 @@ def add_strength_order(opt, u, sel_attacks, surrogate, min_ba, order,
             return capped, cons
         return expr, cons
 
+    # Which fragment's EMBED a stage changes: the sync mark is laid over every fragment, the ring
+    # re-embeds VINE, the tiled grid replaces TrustMark's embed; the angle probe changes no embed.
+    # Read by the acceptance floor (det_cond) and by the admissibility rule further down.
+    FE_AFFECTS = {"resync": list(FRs), "scale": ["VINE"], "tile": ["TrustMark"]}
+
+    def _isotonic(ys):
+        """Least-squares non-decreasing fit (pool adjacent violators).
+
+        An acceptance rate rises with embedding strength; the measured curve does not, because each knot
+        is a proportion over 30 to 100 images and carries a standard error of 0.05 to 0.09. Reading the
+        raw curve, one noisy dip after the crossing forces the bound up to that dip. Fitting the
+        monotone shape first uses every knot to place the crossing instead of the worst one."""
+        vals, wts = [], []
+        for y in ys:
+            vals.append(float(y)); wts.append(1.0)
+            while len(vals) > 1 and vals[-2] > vals[-1] + 1e-15:
+                v2, w2 = vals.pop(), wts.pop(); v1, w1 = vals.pop(), wts.pop()
+                vals.append((v1 * w1 + v2 * w2) / (w1 + w2)); wts.append(w1 + w2)
+        out = []
+        for v, w in zip(vals, wts): out.extend([v] * int(round(w)))
+        return out
+
+    def _floor_strength(curve, level):
+        """The smallest strength at which the fitted rate reaches `level`, interpolating the crossing;
+        None when it never does. The fitted curve is non-decreasing, so the strengths that clear a floor
+        are a half-line and one linear bound replaces a piecewise-linear gadget in the model."""
+        xs = curve.xs; ys = _isotonic(curve.ys)
+        j = next((i for i, y in enumerate(ys) if y >= level - 1e-12), None)
+        if j is None: return None
+        if j == 0: return xs[0]
+        x0, x1, y0, y1 = xs[j - 1], xs[j], ys[j - 1], ys[j]
+        return x1 if y1 == y0 else x0 + (level - y0) * (x1 - x0) / (y1 - y0)
+
+    def det_cond(f, a, nsel):
+        """z3 condition: fragment f's per-image ACCEPTANCE rate on column a reaches det_min, under
+        whichever front-end stage the configuration turns on, at the threshold the request owes.
+
+        The coverage clause compares a MEAN bit accuracy against a threshold. The deployment accepts each
+        image on its own, so the quantity a request needs is the fraction of images that clear its
+        threshold, and the mean cannot stand in for it when the per-image distribution is bimodal
+        (UnMarker under the ring at strength 0.3: mean 0.694, half the images at 0.99 and half at chance)
+        or merely sits on the threshold, which a certified optimum does. Measured on the certified C4
+        requests: four of nine cleared the mean UnMarker threshold and detected 0.30 to 0.80 of the images.
+
+        The threshold FOLLOWS THE FRAGMENT COUNT, exactly as the coverage clause's does: a k-fragment
+        configuration runs k+1 zero-bit tests inside one budget, so each test is charged budget/(k+1),
+        and a single fragment is charged nothing of the sort. Using the three-fragment threshold
+        throughout, as the first version did, charges a multiplicity that is not spent: on VINE under
+        CtrlRegen+ at step 0.5 it moved the line from 0.630 to 0.660, which turned "91% of images clear
+        it at strength 0.9" into "no strength is enough", and single-fragment C4 paid it on every request.
+
+        The rate comes from the stored PER-IMAGE values (surrogate.rate_curve) rather than from a stored
+        curve, because no stored curve could be the right one for every budget and count. With a stage on,
+        the stage's own per-image cell is read; where there is none and the stage does not change this
+        fragment's embed (FE_AFFECTS), the plain per-image cell stands, since it is the same embed at the
+        request's threshold; where the stage does change the embed and no per-image cell describes it,
+        the fragment gets no credit under that stage (no evidence, no credit). The det_fe_* curves of
+        the front-end campaign (rates at the decoder's default 1% budget) are records only: not read.
+        """
+        def bound(curve):
+            if curve is None: return z3.BoolVal(True)
+            s_star = _floor_strength(curve, min(1.0, float(det_min) + float(rate_margin)))   # the deployed floor plus its margin, asked of the table
+            return z3.BoolVal(False) if s_star is None else (s[f] >= z3.RealVal(s_star))
+        def at(k):
+            tau = presence_threshold(min_ba, k)
+            expr = bound(surrogate.rate_curve(f, a, tau))
+            for cname, cvar in (FE_VARS or {}).items():
+                if cvar is None: continue
+                curve = surrogate.rate_curve(f, a, tau, stage=cname)
+                if curve is None and f not in FE_AFFECTS.get(cname, []):
+                    # The stage does not change this fragment's embed, so the plain per-image cell IS
+                    # this embed read at the request's own threshold: exact where the stage does not
+                    # fire, a lower bound where its cascade rescues images.
+                    continue
+                if curve is None:
+                    # The stage re-embeds this fragment and nobody measured that embed per image on this
+                    # column: no evidence, no credit. (The stage's det_fe_* curve, a rate at the decoder's
+                    # default budget that the live loop never patches, is retired and not read.) A table
+                    # with no per-image block at all has no floor anywhere, so nothing to withhold.
+                    if getattr(surrogate, "_perimage", None):
+                        expr = z3.If(cvar, z3.BoolVal(False), expr)
+                    continue
+                expr = z3.If(cvar, bound(curve), expr)
+            return expr
+        return z3.If(nsel <= 1, at(1), z3.If(nsel == 2, at(2), at(3)))
+
     # NOTE for anyone comparing this solver against the grid enumerator in the necessity
     # experiment: that enumerator evaluates surrogate.base() directly and models no front-end
     # variables, so the two only solve the SAME problem when the front-ends are disabled. Run
@@ -743,14 +972,19 @@ def add_strength_order(opt, u, sel_attacks, surrogate, min_ba, order,
     # TrustMark curve, promised 0.94, delivered 0.82, and was certified a false SAT live. So on such a
     # request the stage may not be enabled together with the fragment it changes. Tables that predate
     # the per-stage curves (no base_fe_* cell at all) keep the legacy bundled behaviour.
-    FE_AFFECTS = {"resync": list(FRs), "scale": ["VINE"], "tile": ["TrustMark"]}   # angle changes no embed
+    # FE_AFFECTS is defined above det_cond, which reads it too.
     if any(k.startswith("base_fe_") for k in getattr(surrogate, "_frontend", {})):
         for cname, affected in FE_AFFECTS.items():
             cvar = (FE_VARS or {}).get(cname)
             if cvar is None: continue
             for f in affected:
                 if f not in FRs: continue
-                unmeasured = [a for a in sel_attacks if surrogate.frontend(f"base_fe_{cname}_{f}|{a}") is None]
+                # An ADVERSARIAL column (UnMarker) is live-only: the table never settles it, whatever it
+                # holds there is a prior for the search, and the live measurement of the returned
+                # configuration is the verdict. So a missing replacement curve on it does not make the
+                # stage inadmissible; the plain curve stands in as the prior and live decides.
+                unmeasured = [a for a in sel_attacks if a not in ADVERSARIAL
+                              and surrogate.frontend(f"base_fe_{cname}_{f}|{a}") is None]
                 if unmeasured:
                     opt.add(z3.Implies(cvar, z3.Not(u[f])))
 
@@ -772,6 +1006,7 @@ def add_strength_order(opt, u, sel_attacks, surrogate, min_ba, order,
     nsel = z3.Sum([z3.If(u[g], 1, 0) for g in FRs])
     _t = lambda k: z3.RealVal(min(1.0, presence_threshold(min_ba, k) + float(margin)))
     thr = z3.If(nsel <= 1, _t(1), z3.If(nsel == 2, _t(2), _t(3)))
+    eff_ba = {}          # (f, a) -> the bit-accuracy expression coverage is judged on; capacity reads it too
     for a in sel_attacks:
         clears = []
         for f in FRs:
@@ -786,7 +1021,11 @@ def add_strength_order(opt, u, sel_attacks, surrogate, min_ba, order,
                 if (f, g, a) in pair_used:                       # the pair curve already holds the interference
                     after = z3.And(after, z3.Not(pair_used[(f, g, a)]))
                 drops.append(z3.If(after, dexpr, z3.RealVal(0)))
-            clears.append(z3.And(u[f], bexpr - z3.Sum(drops) >= thr))      # fragment f (if selected) clears attack a
+            eff_ba[(f, a)] = bexpr - z3.Sum(drops)
+            cover = eff_ba[(f, a)] >= thr
+            if det_min and det_min > 0.0:
+                cover = z3.And(cover, det_cond(f, a, nsel))
+            clears.append(z3.And(u[f], cover))                             # fragment f (if selected) clears attack a
         opt.add(z3.Or(*clears))                                            # at least one selected fragment clears a
     # distortion D = sum_f d_f(s_f) + sum_{f<g} e_{fg}(s_f+s_g) [gated by co-select]; PSNR = -D proxy
     dterms=[]
@@ -814,19 +1053,35 @@ def add_strength_order(opt, u, sel_attacks, surrogate, min_ba, order,
     # solver would return front-ends it has no reason to return. The cost is a measured function of
     # the carrying fragment's strength, on the same MSE scale as d and e.
     FE_HOST = {"resync": "TrustMark", "scale": "VINE", "tile": "TrustMark"}
+    # The tiled grid REPLACES TrustMark's embed, so it costs nothing unless TrustMark is selected. The
+    # SyncSeal mark is its own embed on top of the image: it is paid whenever resync is on, whatever the
+    # fragment set (2026-09-08: charged only with TrustMark selected, VINE+VideoSeal+resync solutions
+    # reported 1.7 dB more than they delivered; live 38.97 dB against 40.68 in the table, the missing
+    # 2.68 MSE being exactly penalty_fe_resync). Its curve is indexed by the host's strength and is flat,
+    # so without the host it is charged at the curve's mid-range value.
+    FE_MARK_INDEPENDENT = {"resync"}
     for cname, host in FE_HOST.items():
         if cname == "scale": continue                    # already charged as nested_penalty above
         cvar = (FE_VARS or {}).get(cname)
         pc = surrogate.frontend(f"penalty_fe_{cname}")
-        if cvar is None or pc is None or host not in FRs: continue
-        pe, pcons = pc.add_to_z3(s[host], f"fepen_{cname}")
-        for c in pcons: opt.add(c)
+        if cvar is None or pc is None: continue
+        if host not in FRs and cname not in FE_MARK_INDEPENDENT: continue
         # A front-end is bought for coverage, never as a fidelity rebate. The tiled grid measures a
         # slightly NEGATIVE cost (it writes a little less energy than the full-frame embed, -0.1 to
         # -1.6 MSE) and, left signed, that rebate alone made the solver attach the grid to a TrustMark
         # that covered nothing -- a structural choice driven by 0.04 dB. The lower energy is already
         # accounted for where it matters, in the stage's lower replacement curves.
-        dterms.append(z3.If(z3.And(cvar, u[host]), z3.If(pe > 0, pe, z3.RealVal(0)), z3.RealVal(0)))
+        pe_pos = None
+        if host in FRs:
+            pe, pcons = pc.add_to_z3(s[host], f"fepen_{cname}")
+            for c in pcons: opt.add(c)
+            pe_pos = z3.If(pe > 0, pe, z3.RealVal(0))
+        if cname in FE_MARK_INDEPENDENT:
+            const = z3.RealVal(max(0.0, float(pc.eval(0.5 * (pc.xs[0] + pc.xs[-1])))))
+            cost = z3.If(u[host], pe_pos, const) if pe_pos is not None else const
+            dterms.append(z3.If(cvar, cost, z3.RealVal(0)))
+        else:
+            dterms.append(z3.If(z3.And(cvar, u[host]), pe_pos, z3.RealVal(0)))
     # Prune: a stage with no responsible column among the requested attacks is fixed off.
     opt._fe_responsible = {k: sorted(v) for k, v in FE_RESP.items()}
     for cname, cvar in (FE_VARS or {}).items():
@@ -855,39 +1110,21 @@ def add_strength_order(opt, u, sel_attacks, surrogate, min_ba, order,
     if min_psnr is not None and min_psnr > 0:
         opt.add(D <= (255.0 ** 2) / (10.0 ** (float(min_psnr) / 10.0)))
 
-    # CAPACITY, from the measured per-strength curves. Same best-path (OR) semantics as feasibility:
-    # the same ID is repeated across fragments, so the best survivor carries it. Capacity is strongly
-    # strength-dependent (a cell ranges from ~0 to ~96 bits across one fragment's grid), which a single
-    # constant per (fragment, attack) cannot express. Front-end capacity recovery is NOT measured, so
-    # these are the plain-fragment curves: with a front-end enabled this understates capacity, which is
-    # the safe direction (it can only reject a config that would have passed, never admit one that fails).
+    # CAPACITY. The payload a fragment carries through a column is derived from the same bit-accuracy
+    # expression coverage is judged on: ba_to_bits gives the reliable bits of the codeword at that
+    # accuracy, so `capacity >= min_bits` is the strength condition `ba >= bits_to_ba(min_bits)`, with the
+    # same best-path (OR) semantics as coverage (the ID is repeated across fragments, the best survivor
+    # carries it). Deriving it from bit accuracy rather than reading the measured capacity curves gives
+    # three things the curves could not: every column has it (18 cells had no curve and fell back to a
+    # strength-flat constant), it follows the front-end the solver enables (the replacement curve
+    # describes the changed embed, so the tiled-TrustMark carve-out that once lived here is no longer
+    # needed), and a live measurement of bit accuracy re-certifies it through with_live (a soft-information
+    # capacity cannot be measured live). It is a lower bound on the measured curves at every requested
+    # payload size (see ba_to_bits), so it never grants a payload the measurement refused.
     if min_bits > 0:
+        ba_star = z3.RealVal(min(1.0, bits_to_ba(min_bits) + float(margin)))     # the capacity line plus the request's margin
         for a in sel_attacks:
-            caps = []
-            for f in FRs:
-                # Capacity curves are measured for the PLAIN embed. The tiled grid changes TrustMark's
-                # embed so much that its bit accuracy on the non-geometric columns sits far below the
-                # plain curve (0.46 against 0.67 at the lowest knot under VAE), so the plain capacity
-                # would credit bits the tiled embed cannot carry; a tiled TrustMark therefore carries
-                # no capacity credit. The ring and the sync mark measure within a few points of the
-                # plain curve and keep it.
-                tile_var = (FE_VARS or {}).get("tile")
-                carries = u[f] if not (f == "TrustMark" and tile_var is not None) else z3.And(u[f], z3.Not(tile_var))
-                cp = getattr(surrogate, "cap", lambda *_: None)(f, a)
-                if cp is not None:
-                    ce, cc = cp.add_to_z3(s[f], f"cap_{f}_{a}")
-                    for c in cc: opt.add(c)
-                    caps.append(z3.And(carries, ce >= min_bits))
-                else:
-                    # No measured curve for this cell (the strength sweep covers the in-process
-                    # family; the diffusion family was measured at reference strengths only), so
-                    # fall back to the measured constant. Capacity therefore stays constrained on
-                    # every attack -- strength-resolved where that was measured, flat elsewhere --
-                    # rather than silently dropping out on the attacks that lack a curve.
-                    const = CAP.get(f, {}).get(a)
-                    if const is not None:
-                        caps.append(z3.And(carries, z3.BoolVal(float(const) >= min_bits)))
-            if caps: opt.add(z3.Or(*caps))
+            opt.add(z3.Or(*[z3.And(u[f], eff_ba[(f, a)] >= ba_star) for f in FRs]))
     return s, p, psnr
 
 def report(tag,opt,use,resync,nested,a_lvl,psnr,time,attacks,min_ba):

@@ -18,14 +18,19 @@ REPO = "/work/pi_shiqingma_umass_edu/mingzheli/cryptographic_fingerprint"
 sys.path.insert(0, REPO); sys.path.insert(0, os.path.join(REPO, "scripts"))
 from src.shortened_bch import ShortenedBCH
 from src.vine_crypto_wrapper import VineCryptoWrapper, apply_crypto
-from src.phasemark import PhaseMarkWrapper
 from src.trustmark_fragment import TrustMarkFragment
 from src.videoseal_fragment import VideoSealFragment
-from src.maskwm_wrapper import MaskWMWrapper
-from src.learned_fragment_methods import DFTKredMethod, QuantQIMMethod
 from src.soft_fusion import method_soft_to_codeword_llr, fuse_llrs, llr_to_bits
 from src.soft_bch import decode_and_verify
-from src.fusion_head3 import load_head3, head3_llr
+# The rejected fragments (PhaseMark, MaskWM, DFT/QIM) and the retired learned head are only reachable from this
+# file's own command-line evaluation; the deployed cascade imports this module for scale_resid /
+# nested_vine_embed / rot and must not depend on them, so they are imported where they are used.
+def _legacy():
+    from src.phasemark import PhaseMarkWrapper
+    from src.maskwm_wrapper import MaskWMWrapper
+    from src.learned_fragment_methods import DFTKredMethod, QuantQIMMethod
+    from src.fusion_head3 import load_head3, head3_llr
+    return PhaseMarkWrapper, MaskWMWrapper, DFTKredMethod, QuantQIMMethod, load_head3, head3_llr
 from src.syncseal_frontend import load_sync, sync_embed, sync_rectify, DEFAULT_JIT
 from src.payload import image_id_to_payload
 
@@ -39,13 +44,13 @@ SPEC = {"phasemark": ("logit", "raw_scores", "target"), "vine": ("prob", "raw_pr
 
 def build(fragments, dev, sb, tm_variant="B"):
     b = {
-        "phasemark": lambda: PhaseMarkWrapper(master_key=KEY, method_name="phasemark", n_bits=sb.n, vae_key="sd21", device=dev),
+        "phasemark": lambda: _legacy()[0](master_key=KEY, method_name="phasemark", n_bits=sb.n, vae_key="sd21", device=dev),
         "vine":      lambda: VineCryptoWrapper(master_key=KEY, method_name="vine", n_bits=sb.n, device=dev),
-        "dft":       lambda: DFTKredMethod(os.path.join(REPO, "results/dft_fftaware_baseline/ckpt.pt"), KEY, "dft_kred", dev),
-        "qim":       lambda: QuantQIMMethod(os.path.join(REPO, "results/quant_qim_frozen_d006/ckpt.pt"), KEY, "quant_qim", dev),
+        "dft":       lambda: _legacy()[2](os.path.join(REPO, "results/dft_fftaware_baseline/ckpt.pt"), KEY, "dft_kred", dev),
+        "qim":       lambda: _legacy()[3](os.path.join(REPO, "results/quant_qim_frozen_d006/ckpt.pt"), KEY, "quant_qim", dev),
         "trustmark": lambda: TrustMarkFragment(master_key=KEY, method_name="trustmark", n_bits=sb.n, model_type=tm_variant, device=dev),
         "videoseal": lambda: VideoSealFragment(master_key=KEY, method_name="videoseal", n_bits=sb.n, device=dev),
-        "maskwm":    lambda: MaskWMWrapper(ckpt_path=os.path.join(REPO, "external/MaskWM/checkpoints/D_128bits.pth"),
+        "maskwm":    lambda: _legacy()[1](ckpt_path=os.path.join(REPO, "external/MaskWM/checkpoints/D_128bits.pth"),
                                            master_key=KEY, method_name="maskwm", n_bits=sb.n, device=dev),
     }
     return {n: b[n]() for n in fragments}
@@ -163,7 +168,7 @@ def main():
     # learned 3-way gated fusion head: default ON for the VINE+TM+VideoSeal composite
     HEAD3_FRAGS = ["vine", "trustmark", "videoseal"]
     use_head3 = (not args.no_head3 and args.fragments == HEAD3_FRAGS and os.path.exists(args.head3_ckpt))
-    head3 = load_head3(args.head3_ckpt, dev) if use_head3 else None
+    head3 = _legacy()[4](args.head3_ckpt, dev) if use_head3 else None
     use_bestpath = not args.no_bestpath
     sync = load_sync(args.syncseal_jit, dev) if (args.syncseal or args.geo_cascade) else None
     # add the standalone TrustMark OR-tier only when neither pixel geometry fragment is fused
@@ -276,7 +281,7 @@ def main():
             al[name] = method_soft_to_codeword_llr(getattr(m, getter)(att), perm, M, kind=kind, n_codeword=sb.n)
         # primary fused codeword: learned 3-way gated head when available, else equal-MRC
         if use_head3:
-            fused = head3_llr(head3, al["vine"], al["trustmark"], al["videoseal"], dev)
+            fused = _legacy()[5](head3, al["vine"], al["trustmark"], al["videoseal"], dev)
         else:
             fused = fuse_llrs(al, weights=None, n_codeword=sb.n)
         fba = float(np.mean(llr_to_bits(fused) == tx))

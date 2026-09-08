@@ -43,11 +43,22 @@ def table_value(sg, cfg, f, a):
     return float(sg.base(f, a).eval(cfg["s"][f])), None
 
 
-def solve_with_live(scen, measure, sg0, live_ok, max_rounds=4, k=2.0, prior_sd=None, asymmetric=True, log=None):
+def solve_with_live(scen, measure, sg0, live_ok, max_rounds=4, k=2.0, prior_sd=None, asymmetric=True,
+                    log=None, xenv_measure=None, xenv_ok=()):
     """Returns a dict with verdict, cfg, rounds, patched cells and per-attack provenance.
 
     `measure(cfg, attack) -> {fragment: (mean, se, n)}` is the live measurement of THIS configuration
-    on the user's images (cfg carries `threshold`, the value coverage is judged against)."""
+    on the user's images (cfg carries `threshold`, the value coverage is judged against).
+
+    Some columns the offline table is not allowed to settle at all (W.live_required_at): UnMarker,
+    because it optimises against the image in front of it, and any column whose table value sits within
+    k image-to-image standard deviations of the threshold, because a certified optimum sits ON the
+    constraint and the specific image then lands on either side. Those columns are measured here when an
+    executor can run them -- `measure` for the in-process attacks, `xenv_measure` for the ones that need
+    their own environment (UnMarker, CtrlRegen+), named in `xenv_ok`. Every column of the request is
+    measured when an executor exists, gated or not; a column with no executor never comes back as a table
+    verdict: it is listed in `pending_live` and the request is reported as SAT pending that measurement,
+    never as live-certified. The gate's verdict per column is kept in `live_reason` as the expected risk."""
     offsets, patched, t0 = {}, [], time.time()
     say = log or (lambda *a, **kw: None)
     for rnd in range(1, max_rounds + 1):
@@ -55,19 +66,38 @@ def solve_with_live(scen, measure, sg0, live_ok, max_rounds=4, k=2.0, prior_sd=N
         built, m, _r, cert = W.solve_exact_model(scen, enable_order=True, continuous_strength=True, surrogate=sg)
         if built is None:
             return {"verdict": "UNSAT", "cfg": None, "rounds": rnd, "patched": patched,
-                    "provenance": {a: "table" for a in scen["attacks"]}, "sec": time.time() - t0}
+                    "provenance": {a: "table" for a in scen["attacks"]}, "pending_live": [],
+                    "live_reason": {}, "sec": time.time() - t0}
         cfg = read_config(built, m)
-        thr = min(1.0, W.presence_threshold(scen["min_ba"], len(cfg["order"])) + float(scen.get("margin", 0.0)))
+        thr = min(1.0, W.presence_threshold(scen["min_ba"], len(cfg["order"])) + float(scen.get("margin", W.DEFAULT_MARGIN)))
         cfg["threshold"] = thr
-        contradictions, prov, moved = [], {}, False
+        # A payload request is also held to the bit accuracy its capacity needs (the solver derives
+        # capacity from bit accuracy, see W.ba_to_bits). Where that is the binding line, the live gate
+        # and the contradiction check read the cell against it; the per-image acceptance in the
+        # measurement stays at the presence threshold, which is what the deployed decoder applies.
+        cfg["threshold_bits"] = W.bits_to_ba(scen["min_bits"]) if scen.get("min_bits", 0) > 0 else 0.0
+        line = max(thr, cfg["threshold_bits"])
+        contradictions, prov, moved, pending, why_live = [], {}, False, [], {}
         for a in scen["attacks"]:
-            if a not in live_ok:
-                prov[a] = "table"; continue
-            tab = max(table_value(sg, cfg, f, a)[0] for f in cfg["order"] if (f, a) in sg._base)
-            live = measure(cfg, a)
+            cells = [f for f in cfg["order"] if (f, a) in sg._base]
+            if not cells:
+                prov[a] = "table (no curve for the selected fragments)"; continue
+            tab = max(table_value(sg, cfg, f, a)[0] for f in cells)
+            stage = table_value(sg, cfg, cells[0], a)[1]
+            need, why = W.live_required_at(a, tab, line, k=k, stage=stage)
+            run = measure if a in live_ok else (xenv_measure if (a in xenv_ok and xenv_measure) else None)
+            why_live[a] = why
+            if run is None:
+                # No executor for this column. Every solve ends with a live check of every column it named
+                # (user 2026-09-08): the table proposes, it never settles. A column nobody measured leaves
+                # the request pending, whatever the gate says; the gate's reason stays on record as the
+                # expected risk of that column (adversarial, near-threshold, or clear of the threshold).
+                prov[a] = "live required (not executed)"; pending.append(a)
+                continue
+            live = run(cfg, a)
             live_best = max(v[0] for v in live.values())
             prov[a] = "live"
-            if (live_best >= thr - 1e-9) == (tab >= thr - 1e-9):
+            if (live_best >= line - 1e-9) == (tab >= line - 1e-9):
                 continue
             contradictions.append(a)
             for f, (mean, se, n) in live.items():
@@ -81,16 +111,22 @@ def solve_with_live(scen, measure, sg0, live_ok, max_rounds=4, k=2.0, prior_sd=N
                 if abs(d) > 1e-12 and abs(offsets.get(key, 0.0) - d) > 1e-12:
                     offsets[key] = d; moved = True
         say(f"  round {rnd}: {'+'.join(cfg['order'])} s={ {f: round(v, 3) for f, v in cfg['s'].items()} } "
-            f"fe={cfg['fe_on'] or ['-']} thr={thr:.3f} -> {len(contradictions)} contradiction(s)" + (f" {contradictions}" if contradictions else ""))
+            f"fe={cfg['fe_on'] or ['-']} thr={line:.3f} -> {len(contradictions)} contradiction(s)" + (f" {contradictions}" if contradictions else ""))
+        if pending:
+            say(f"    live required but not executed on {pending}")
         if not contradictions:
-            return {"verdict": "SAT (live-certified)", "cfg": cfg, "rounds": rnd, "patched": patched, "provenance": prov, "sec": time.time() - t0}
+            v = "SAT (live-certified)" if not pending else "SAT (pending live: " + ",".join(pending) + ")"
+            return {"verdict": v, "cfg": cfg, "rounds": rnd, "patched": patched, "provenance": prov,
+                    "pending_live": pending, "live_reason": why_live, "sec": time.time() - t0}
         if not moved:
             # every disagreement is inside the live measurement's own noise: nothing to patch, so
             # re-solving would only re-propose the same configuration
-            return {"verdict": "SAT (live-inconclusive: disagreement within noise)", "cfg": cfg, "rounds": rnd,
-                    "patched": patched, "provenance": prov, "sec": time.time() - t0}
+            v = "SAT (live-inconclusive: disagreement within noise)" if not pending else \
+                "SAT (pending live: " + ",".join(pending) + "; other disagreements within noise)"
+            return {"verdict": v, "cfg": cfg, "rounds": rnd, "patched": patched, "provenance": prov,
+                    "pending_live": pending, "live_reason": why_live, "sec": time.time() - t0}
     return {"verdict": "SAT (uncertified: round budget)", "cfg": cfg, "rounds": max_rounds, "patched": patched,
-            "provenance": prov, "sec": time.time() - t0}
+            "provenance": prov, "pending_live": pending, "live_reason": why_live, "sec": time.time() - t0}
 
 
 def composite_measurer(covers, dev="cuda"):

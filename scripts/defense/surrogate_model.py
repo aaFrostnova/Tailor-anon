@@ -38,7 +38,7 @@ class PWL:
 
 class Surrogate:
     def __init__(self, fragments, attacks, ranges, base, delta, d, e, cap=None, frontend=None,
-                 latency=None):
+                 latency=None, perimage=None):
         self.fragments=list(fragments); self.attacks=list(attacks); self._ranges=dict(ranges)
         self._base=base; self._delta=delta; self._d=d; self._e=e   # dict-keyed PWLs
         # OPTIONAL measured extras (absent in older tables, so every accessor returns None instead
@@ -51,6 +51,40 @@ class Surrogate:
         #                   (a float placed in one is silently dropped when the table is loaded)
         self._cap=dict(cap or {}); self._frontend=dict(frontend or {})
         self._latency=dict(latency or {})
+        # PER-IMAGE values behind a curve: {"F|a" or "stage:F|a": {"xs": knots, "ba": [[per image] per
+        # knot], "ver": same shape of booleans or None, "n": images}}. The curve blocks store E[ba]; the
+        # deployment accepts per image against a threshold that depends on the request, so what a
+        # request needs is P(ba >= tau), which the mean cannot give when the per-image distribution
+        # is bimodal (UnMarker under the ring at s=0.3: mean 0.694, half the images at 0.99 and half at
+        # chance). Kept as raw values rather than as a rate curve because the rate depends on tau, and
+        # tau on the request's false-positive budget and fragment count: one stored curve per (cell,
+        # budget, count) would be 9,720 curves, while the raw values give any of them exactly.
+        self._perimage=dict(perimage or {})
+
+    # ---- per-image rates ------------------------------------------------------------------------
+    @staticmethod
+    def perimage_key(f, a, stage=None):
+        return f"{stage}:{f}|{a}" if stage else f"{f}|{a}"
+
+    def has_perimage(self, f, a, stage=None):
+        return self.perimage_key(f, a, stage) in self._perimage
+
+    def rate_curve(self, f, a, tau, stage=None):
+        """P(accepted) at each measured knot for threshold `tau`, as a PWL in f's strength, or None.
+
+        An image is accepted when its keyed verification passed (the identity test, budget-free) or
+        its bit accuracy reaches tau (the presence test). Campaigns that embedded random bits carry no
+        verification flag; there the rate is P(ba >= tau) alone, which undercounts by the soft-decoding
+        margin (measured: 8.4% of verified reads sit at 0.85 to 0.88, below the hard limit 0.90) and
+        never overcounts."""
+        rec = self._perimage.get(self.perimage_key(f, a, stage))
+        if rec is None: return None
+        xs = list(rec["xs"]); ys = []
+        for j in range(len(xs)):
+            ba = np.asarray(rec["ba"][j], dtype=float)
+            ver = np.asarray(rec["ver"][j], dtype=bool) if rec.get("ver") else np.zeros(len(ba), dtype=bool)
+            ys.append(float(np.mean(ver | (ba >= float(tau) - 1e-12))))
+        return PWL(xs, ys)
     # ---- request-scoped refinement -------------------------------------------------------------
     # A live measurement lands at ONE strength, but the solver reads a curve. Patching only that point
     # would let the next round step to s+eps and read the un-patched, optimistic value, so the loop
@@ -73,7 +107,11 @@ class Surrogate:
         the loop re-proposing the same configuration until its round budget ran out."""
         import copy as _c
         sg = _c.copy(self)
-        sg._base = dict(self._base); sg._frontend = dict(self._frontend)
+        sg._base = dict(self._base); sg._frontend = dict(self._frontend); sg._perimage = dict(self._perimage)
+        def _shift_perimage(pk, d):
+            rec = self._perimage.get(pk)
+            if rec is None: return
+            sg._perimage[pk] = {**rec, "ba": [[min(1.0, max(0.0, float(b) + d)) for b in row] for row in rec["ba"]]}
         for key, d in (offsets or {}).items():
             if abs(d) < 1e-12:
                 continue
@@ -81,10 +119,12 @@ class Surrogate:
                 name = self.fe_key(*key[1:]); c = self._frontend.get(name)
                 if c is not None:
                     sg._frontend[name] = PWL(list(c.xs), [min(1.0, max(0.0, y + d)) for y in c.ys])
+                _shift_perimage(self.perimage_key(key[2], key[3], key[1]), d)
             else:
                 c = self._base.get(tuple(key))
                 if c is not None:
                     sg._base[tuple(key)] = PWL(list(c.xs), [min(1.0, max(0.0, y + d)) for y in c.ys])
+                _shift_perimage(self.perimage_key(key[0], key[1]), d)
         return sg
 
     def live_offset(self, f, a, strength, measured, se_live=None, se_table=None,
@@ -147,7 +187,8 @@ class Surrogate:
                 "e":{f"{p[0]}|{p[1]}":pk(self._e[p]) for p in self._e},
                 **({"cap":{f"{f}|{a}":pk(self._cap[(f,a)]) for (f,a) in self._cap}} if self._cap else {}),
                 **({"frontend":{k:pk(v) for k,v in self._frontend.items()}} if self._frontend else {}),
-                **({"latency":dict(self._latency)} if self._latency else {})}
+                **({"latency":dict(self._latency)} if self._latency else {}),
+                **({"perimage":dict(self._perimage)} if self._perimage else {})}
     @staticmethod
     def from_dict(dd):
         mk=lambda o:PWL(o["xs"],o["ys"])
@@ -162,8 +203,10 @@ class Surrogate:
                   if isinstance(v,dict) and "xs" in v}
         latency={k:float(v) for k,v in (dd.get("latency") or {}).items()
                  if isinstance(v,(int,float))}
+        perimage={k:v for k,v in (dd.get("perimage") or {}).items()
+                  if isinstance(v,dict) and "xs" in v and "ba" in v}
         return Surrogate(dd["fragments"],dd["attacks"],dd["ranges"],base,delta,d,e,
-                         cap=cap, frontend=frontend, latency=latency)
+                         cap=cap, frontend=frontend, latency=latency, perimage=perimage)
 
 def synthetic_surrogate(fragments=("VINE","TrustMark","VideoSeal"), attacks=tuple(PHASE1_ATTACKS)):
     import numpy as np

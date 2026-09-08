@@ -18,7 +18,7 @@
 - Surrogate structure is `per-fragment + pairwise` for BOTH bit-acc (`base_f − Σδ_{g→f}`) and distortion (`Σd_f + Σe_{fg}`). Pairwise-additivity tolerance gate: `|Δba| ≤ 0.02` and `|ΔPSNR| ≤ 0.3 dB`.
 - `build()` default path (order/strength disabled) MUST stay byte-identical to today; a regression test pins it.
 - Phase-1 attack suite is the in-process family only: `jpeg25, blur, noise, bright, contrast, crop75, crop50, rot9, vaeB, vaeC`. Batch/adversarial attacks (regen, rinse, ctrlregen*, unmarker) stay driven by the existing `baseline_table.json` and are out of scope for the strength/order surrogate here.
-- HF token when a wrapper load needs it: `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`. GPU work goes via `sbatch` (partitions `gpu-preempt,gpu`); interactive shell is CPU-only.
+- HF token when a wrapper load needs it: `<HF_TOKEN>`. GPU work goes via `sbatch` (partitions `gpu-preempt,gpu`); interactive shell is CPU-only.
 - Python interpreter: `/home/mingzhel_umass_edu/.conda/envs/fingerprint/bin/python` (`$PYFP`). Do not commit to git unless the user explicitly asks.
 
 ---

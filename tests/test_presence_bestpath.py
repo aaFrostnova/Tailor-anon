@@ -63,8 +63,36 @@ def test_two_fragments_must_clear_the_raised_threshold():
         o, u, rs, ns, al, nf, ps, tm = W.build(min_psnr=0.0, max_ms=1e9, attacks=["jpeg25"], min_ba=b1,
                                               allow_resync=False, allow_nested=False, min_bits=0,
                                               resolution=512, enable_order=True, continuous_strength=True,
-                                              surrogate=sg)
+                                              surrogate=sg, margin=0.0)
         for f in W.FR: o.add(u[f] == (f in force))
         return o.check() == z3.sat
     assert solve(("TrustMark",)) is True
     assert solve(("TrustMark", "VINE")) is False
+
+
+def test_the_default_safety_allowance_raises_the_coverage_threshold():
+    """A curve that clears the bare threshold by less than the allowance is no longer feasible by default.
+
+    The certified optimum sits exactly on the constraint, so with no allowance half the live samples of a
+    binding cell land below it: measured, 7 of 59 certified configurations missed the user's requirement,
+    each by 0.002 to 0.005, inside one standard error of the live mean. Two standard errors of allowance
+    removed all seven. `W.DEFAULT_MARGIN` carries that, and a request can still ask for none.
+    """
+    assert W.DEFAULT_MARGIN == 0.02
+    sg = synthetic_surrogate(attacks=("jpeg25",))
+    b1 = W.beta_from_fpr(1e-2)
+    for f in ("TrustMark", "VINE", "VideoSeal"):
+        lo, hi = sg.range(f)
+        sg._base[(f, "jpeg25")] = PWL([lo, hi], [b1 + 0.01, b1 + 0.01])      # clears the bare threshold only
+
+    def feasible(margin):
+        o, u, *_ = W.build(min_psnr=0.0, max_ms=1e9, attacks=["jpeg25"], min_ba=b1, allow_resync=False,
+                           allow_nested=False, min_bits=0, resolution=512, enable_order=True,
+                           continuous_strength=True, surrogate=sg, margin=margin)
+        o.add(u["TrustMark"])
+        for f in W.FR:
+            if f != "TrustMark": o.add(z3.Not(u[f]))
+        return o.check() == z3.sat
+
+    assert feasible(0.0) is True                    # 0.01 above the bare threshold
+    assert feasible(W.DEFAULT_MARGIN) is False      # not 0.02 above it

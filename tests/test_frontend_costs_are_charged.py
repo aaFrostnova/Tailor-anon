@@ -39,7 +39,7 @@ def _psnr_with(sur, tile_on):
     opt.add(tile if tile_on else z3.Not(tile))
     # a floor both sides clear, so the two models differ only in what the front-end costs
     _, _, psnr = W.add_strength_order(opt, u, ["rot9"], sur, 0.55, False,
-                                      frontends={"tile": tile})
+                                      frontends={"tile": tile}, margin=0.0)
     opt.maximize(psnr)
     assert opt.check() == z3.sat
     return float(opt.model().eval(psnr).as_fraction())
@@ -71,7 +71,7 @@ def test_every_embed_side_front_end_has_a_host_fragment():
 def _time_with(sur, tile_on):
     """The time budget with the stage forced on or off, fragments pinned so the only difference
     between the two models is what the stage costs."""
-    b = W.build(0.0, 1e9, ["rot9"], 0.55, True, True, surrogate=sur, enable_order=True)
+    b = W.build(0.0, 1e9, ["rot9"], 0.55, True, True, surrogate=sur, enable_order=True, margin=0.0)
     o, u, tms = b[0], b[1], b[7]
     # Pin EVERY fragment build() created, not just the ones the surrogate carries. A fragment left
     # free is chosen differently between the two solves and its own cost lands in the difference.

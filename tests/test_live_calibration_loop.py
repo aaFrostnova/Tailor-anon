@@ -20,8 +20,10 @@ def _sg(level):
 
 
 def _scen(beta):
+    # margin 0: these cases place the curves exactly on the threshold to exercise the gate, not the
+    # request's safety allowance (W.DEFAULT_MARGIN), which would move the line they are placed on
     return dict(min_psnr=0.0, max_ms=1e9, attacks=list(ATT), min_ba=beta, allow_resync=False, allow_nested=False,
-                min_bits=0, resolution=512)
+                min_bits=0, resolution=512, margin=0.0)
 
 
 def test_no_contradiction_is_certified_in_one_round():

@@ -20,16 +20,16 @@ Evaluate the robustness of our fragmented cryptographic fingerprint system again
 
 ### Fragment Layout (K=8)
 
-| Fragment | Strategy | Domain | Robust To |
-|:---:|----------|--------|-----------|
-| F0 | pixel | q1 (top-left) | JPEG, noise |
-| F1 | pixel | q2 (top-right) | JPEG, noise |
-| F2 | pixel | q3 (bottom-left) | JPEG, noise |
-| F3 | pixel | q4 (bottom-right) | JPEG, noise |
-| F4 | pixel | center | JPEG, noise |
-| F5 | DCT | low freq [1-12] | JPEG, resize |
-| F6 | DCT | mid freq [12-35] | mild attacks |
-| F7 | DWT-DCT L2 | low freq [1-12] | resize, blur |
+| Fragment | Strategy   | Domain            | Robust To    |
+| :--------:| ------------| -------------------| --------------|
+| F0       | pixel      | q1 (top-left)     | JPEG, noise  |
+| F1       | pixel      | q2 (top-right)    | JPEG, noise  |
+| F2       | pixel      | q3 (bottom-left)  | JPEG, noise  |
+| F3       | pixel      | q4 (bottom-right) | JPEG, noise  |
+| F4       | pixel      | center            | JPEG, noise  |
+| F5       | DCT        | low freq [1-12]   | JPEG, resize |
+| F6       | DCT        | mid freq [12-35]  | mild attacks |
+| F7       | DWT-DCT L2 | low freq [1-12]   | resize, blur |
 
 ## Results
 

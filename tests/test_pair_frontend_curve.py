@@ -1,4 +1,5 @@
-"""A two-fragment front-end curve replaces single-curve-minus-delta when the partner is embedded after the host.
+"""A two-fragment front-end curve replaces single-curve-minus-delta when the partner is embedded after the host,
+but only where the decode cascade actually ran.
 
 The single-fragment replacement curve was measured with the fragment alone and the interference term
 delta_{g->f} with both fragments plain; a stage that changes the embed (the tiled grid, the ring, the sync
@@ -27,6 +28,7 @@ def _sg(with_pair):
                     "penalty_fe_tile": PWL([lo, hi], [0.5, 0.5])}
     if with_pair:   # tiled TrustMark with VINE written over it: still readable
         sg._frontend["base_fe_tile_TrustMark|crop75|with_VINE"] = PWL([lo, hi], [0.93, 0.93])
+        sg._frontend["ctrl_pair_TrustMark|crop75|with_VINE"] = PWL([lo, hi], [0.55, 0.55])   # cascade contributed
     return sg
 
 
@@ -50,3 +52,36 @@ def test_pair_curve_is_ignored_when_partner_comes_first():
     # VINE before TrustMark: nothing overwrites TrustMark, the single tiled curve 0.95 clears either way
     assert _solve(_sg(with_pair=True), vine_after_trustmark=False) == z3.sat
     assert _solve(_sg(with_pair=False), vine_after_trustmark=False) == z3.sat
+
+
+def _sg_shortcircuit():
+    """The measured short-circuit: the partner verifies on the primary view, the cascade never runs, and
+    the host's pair curve sits at chance while its solo curve with the stage is high."""
+    sg = synthetic_surrogate(attacks=ATTACKS)
+    lo, hi = sg.range("TrustMark")
+    vlo, vhi = sg.range("VINE")
+    sg._base[("TrustMark", "crop75")] = PWL([lo, hi], [0.60, 0.60])
+    sg._base[("VINE", "crop75")] = PWL([vlo, vhi], [0.50, 0.50])
+    sg._delta[("VINE", "TrustMark", "crop75")] = PWL([vlo, vhi], [0.0, 0.0])
+    sg._frontend = {"base_fe_tile_TrustMark|crop75": PWL([lo, hi], [0.95, 0.95]),
+                    "base_fe_tile_TrustMark|crop75|with_VINE": PWL([lo, hi], [0.49, 0.49]),
+                    "ctrl_pair_TrustMark|crop75|with_VINE": PWL([lo, hi], [0.49, 0.49]),   # cascade idle
+                    "penalty_fe_tile": PWL([lo, hi], [0.5, 0.5])}
+    return sg
+
+
+def test_a_short_circuited_pair_curve_is_not_the_level():
+    """pair == control means the cascade never ran, so the curve says nothing about the host: the
+    single-fragment replacement curve stands and the configuration remains feasible."""
+    assert _solve(_sg_shortcircuit(), vine_after_trustmark=True) == z3.sat
+
+
+def test_the_gate_can_be_switched_off_for_a_sensitivity_check():
+    sg = _sg_shortcircuit()
+    o, u, *_ = W.build(min_psnr=0.0, max_ms=1e9, attacks=list(ATTACKS), min_ba=0.9,
+                       allow_resync=True, allow_nested=True, min_bits=0, resolution=512,
+                       enable_order=True, continuous_strength=True, surrogate=sg, clean_floor={},
+                       pair_min_cascade=-1.0)
+    o.add(u["TrustMark"]); o.add(u["VINE"]); o.add(z3.Not(u["VideoSeal"])); o.add(o._fevars["tile"])
+    o.add(o._pvars[("TrustMark", "VINE")])
+    assert o.check() == z3.unsat, "with the gate off the short-circuited curve should bind"
