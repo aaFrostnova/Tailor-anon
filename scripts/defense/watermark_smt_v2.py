@@ -697,13 +697,16 @@ def frontend_decisions(opt, model, resync=None, nested=None):
     return {k: bool(z3.is_true(model.eval(v, True))) for k, v in fev.items()}
 
 
-def frontend_config(fe):
-    """Map {stage: bool} onto the keys OursComposite reads, so one place owns the correspondence."""
-    return {"resync": fe.get("resync", False),
-            "nested": fe.get("scale", False),          # the ring is the embed side of the scale search
-            "scale_search": fe.get("scale", False),
-            "angle_sweep": fe.get("angle", False),
-            "tile": fe.get("tile", False)}
+def frontend_config(fe, alpha=None):
+    """Map {stage: bool} onto the keys OursComposite reads, so one place owns the correspondence.
+    `alpha` (the request's false-positive budget) is passed through as the decoder's presence budget."""
+    out = {"resync": fe.get("resync", False),
+           "nested": fe.get("scale", False),          # the ring is the embed side of the scale search
+           "scale_search": fe.get("scale", False),
+           "angle_sweep": fe.get("angle", False),
+           "tile": fe.get("tile", False)}
+    if alpha is not None: out["alpha"] = float(alpha)
+    return out
 
 
 def add_strength_order(opt, u, sel_attacks, surrogate, min_ba, order,

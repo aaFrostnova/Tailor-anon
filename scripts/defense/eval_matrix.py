@@ -161,6 +161,11 @@ class OursComposite:
         }
         self.name = f"Ours{'-B' if vine_variant == 'B' else ''}"   # VINE-B variant = higher-PSNR fragment option
         cfg = config or {}
+        # The request's false-positive budget for the zero-bit presence tests (the keyed tests have their own,
+        # fixed, 2^-37). The solver reasons about the request's budget and the certification re-thresholds
+        # every recorded read at it; until 2026-09-09 the deployed decoder itself always ran at 1 percent.
+        # `config["alpha"]` (or decode(..., alpha=)) sets it; the default keeps the 1 percent behaviour.
+        self.alpha = float(cfg.get("alpha", 0.01))
         self.order = list(cfg.get("order") or cfg.get("frags") or self.ORDER)
         for f in self.order:
             if f not in self.frag: raise ValueError(f"unknown fragment in config: {f}")
@@ -279,7 +284,7 @@ class OursComposite:
                         return (True, rimg) if return_view else True
         return (False, None) if return_view else False
 
-    def decode_no_cascade(self, att, secret):
+    def decode_no_cascade(self, att, secret, alpha=None):
         """The same decode with the geometric cascade suppressed.
 
         The surrogate stores each front-end as an EFFECT: what the cascade adds over the same decoder
@@ -289,13 +294,16 @@ class OursComposite:
         saved = self.geo
         self.geo = False
         try:
-            return self.decode(att, secret)
+            return self.decode(att, secret, alpha=alpha)
         finally:
             self.geo = saved
 
-    def decode(self, att, secret):
+    def decode(self, att, secret, alpha=None):
+        """`alpha`: the request's presence budget (default: the configured self.alpha, 1 percent unless the
+        configuration carries one). It sets the zero-bit thresholds and thereby when the cascade fires."""
         from src.soft_fusion import fuse_llrs, llr_to_bits
         from src.soft_bch import decode_and_verify
+        alpha = self.alpha if alpha is None else float(alpha)
         image_id, tx = secret; aligned = {}; bestpath = False
         for name in self.order:
             a = self._frag_llr(name, att, image_id); aligned[name] = a
@@ -312,7 +320,7 @@ class OursComposite:
         # 0.58 fused, and the fused-only test fired on 23.5% of images the solver had covered). The
         # per-fragment and fused tests share the 1% budget, so their thresholds rise with the count.
         per_ba = {n: float(np.mean(llr_to_bits(a) == tx)) for n, a in aligned.items()}
-        det = fver or bestpath or presence_detected(per_ba, fba, len(aligned))
+        det = fver or bestpath or presence_detected(per_ba, fba, len(aligned), alpha=alpha)
         if self.geo and not det:                              # geometric cascade fires only on primary miss
             ok, view = self.geo_cascade(att, image_id, tx, return_view=True)
             if ok:

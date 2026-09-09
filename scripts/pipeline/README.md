@@ -115,9 +115,10 @@ UnMarker run in their own environments: `scripts/attack/setup_ctrlregen.sh`, `sc
   embed is not re-measured against every partner.
 - UnMarker's table cells are a search prior measured on 30 images; the column is judged live only.
 - Every curve is measured at 512 x 512; the solver refuses other resolutions until a table exists for them.
-- The deployed decoder's presence test runs at a fixed 1 percent budget (`presence_detected`); the request's
-  budget enters the solver and the verdicts (which re-threshold the recorded reads per request), not the
-  decoder's own verdict, and the fused zero-bit test costs every two-fragment configuration one bit of
+- The deployed decoder takes the request's presence budget (`config["alpha"]` or `decode(..., alpha=)`,
+  default 1 percent); the certification's own `det` column is recorded at the default because a
+  configuration's cells are shared by requests with different budgets, and the verdicts re-threshold the
+  recorded reads per request. The fused zero-bit test costs every two-fragment configuration one bit of
   threshold while adding almost no detections (the fused keyed verification is what helps, on 1 to 3 percent
   of images on the diffusion columns).
 - The per-image acceptance floor and the capacity line carry margins (0.96 in the table for a 0.90
