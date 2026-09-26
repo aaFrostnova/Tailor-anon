@@ -17,3 +17,7 @@ bchlib>=2.0
 # Attack models
 #   diffusers>=0.27      regeneration and editing attacks
 #   compressai           neural-compression attacks
+
+# Data generation (stages 1 and 2)
+#   compressai           neural-compression attacks
+#   datasets             image pool construction
