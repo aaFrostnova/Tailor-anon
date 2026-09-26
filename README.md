@@ -16,7 +16,6 @@ src/           watermark fragments, geometric stages, attacks, image pool, soft 
 pipeline/      data generation: the measurement campaigns and the fits they feed
 solver/        SMT model, request protocol, and the live-calibration loop
 measurement/   unified detector, FPR accounting, and the frozen measurement harness
-paper/         exporters that build the reported tables and figures
 inputs/        the frozen offline measurements the solver reads (16 MB, included)
 ```
 
@@ -24,7 +23,7 @@ inputs/        the frozen offline measurements the solver reads (16 MB, included
 
 ```bash
 pip install -r requirements.txt
-export PYTHONPATH=$PWD:$PWD/solver:$PWD/measurement:$PWD/pipeline:$PWD/paper
+export PYTHONPATH=$PWD:$PWD/solver:$PWD/measurement:$PWD/pipeline
 export TAILOR_PROJECT=/your/project        # source tree and fragment checkpoints
 export TAILOR_WORKSPACE=/your/workspace    # campaigns, cells, artifacts
 export TAILOR_ASSETS=/your/checkpoints     # diffusion, VAE and watermark weights
@@ -38,7 +37,9 @@ from their upstream projects; `requirements.txt` lists them.
 
 Stages 1 to 3 build the performance database. They are the expensive part and
 their outputs for the reported runs are in `inputs/`, so a reader who only wants
-to reproduce selection can start at stage 4.
+to reproduce selection can start at stage 4. The repository holds the method
+itself; the exporters that turned the results into the reported tables are not
+part of it.
 
 ### Stage 1. Image pool
 
@@ -132,14 +133,9 @@ paths, and the aligned readouts. `measurement/rigor_protocol.py` and
 `measurement/final_holdout.py` enforce the digest checks that keep the offline
 and live slices disjoint.
 
-### Stage 7. Tables and figures
-
-Each `paper/export_*.py` and `paper/plot_*.py` reads one frozen result file and
-writes one LaTeX table or one figure.
-
 ## What is included, and what is not
 
-`inputs/` ships the frozen outputs of stages 2 to 4, so stages 5 to 7 run
+`inputs/` ships the frozen outputs of stages 2 to 4, so stages 5 and 6 run
 without repeating the measurement campaign:
 
 | File | Contents |
@@ -151,6 +147,7 @@ without repeating the measurement campaign:
 | `prior_width.json` | the prior width used to shrink a live offset |
 | `request_feasibility_matrix.json` | precomputed feasibility per request class |
 | `C1.json` ... `C5.json` | the evaluated request sets, one per scenario |
+| `smt_inputs*.json` | the solo, composite and end-to-end measurements the SMT model reads at import |
 
 Not included, because of size: the image pool, the 30,333 measurement cells
 (about 800 MB), and the fragment and attack model checkpoints. Stages 1, 2 and 5

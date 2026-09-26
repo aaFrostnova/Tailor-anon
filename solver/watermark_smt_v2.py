@@ -5,13 +5,22 @@
  - Pareto mode (--pareto): enumerate quality/robustness/speed trade-offs instead of one lexicographic pick.
 Regen/rinse/rot/crop bit-acc for VINE/TM come from frag_suite (n=20) + memory (regen 0.92/0.80, TM regen dead).
 """
-import json, sys, argparse, math
+import json, sys, os, argparse, math
 from z3 import (Optimize, Bool, Int, Real, If, Or, And, Not, Implies, Sum, BoolVal, sat, is_true,
                 AtMost)
-CF="/data/tailor/project"
-D=json.load(open(CF+"/results/defense/smt_inputs.json"))              # solo: VINE alpha-sweep + per-frag solo PSNR + timing
-DC=json.load(open(CF+"/results/defense/smt_inputs_composite.json"))    # composite PSNR stack anchors
-FULL=json.load(open(CF+"/results/defense/smt_inputs_full.json"))       # n=100 end-to-end: per-attack composite bit-acc + DEPLOYED detection (validated fused>=best-path)
+CF=os.environ.get("TAILOR_PROJECT", "/data/tailor/project")
+_BUNDLED=os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "inputs")
+
+def _frozen(name):
+    """A frozen solver input: the copy bundled in inputs/, else the project tree."""
+    for candidate in (os.path.join(_BUNDLED, name), os.path.join(CF, "results/defense", name)):
+        if os.path.exists(candidate):
+            return json.load(open(candidate))
+    raise FileNotFoundError(f"{name}: not in {_BUNDLED} nor under TAILOR_PROJECT")
+
+D=_frozen("smt_inputs.json")              # solo: VINE alpha-sweep + per-frag solo PSNR + timing
+DC=_frozen("smt_inputs_composite.json")   # composite PSNR stack anchors
+FULL=_frozen("smt_inputs_full.json")      # n=100 end-to-end: per-attack composite bit-acc + DEPLOYED detection
 # F = validated n=100 composite bit-acc (VINE/TM/VideoSeal) + regen/rinse from hidden_big composite
 PA=FULL["per_attack"]; REGC={"VINE":{"regen":0.93,"rinse":0.88},"TrustMark":{"regen":0.50,"rinse":0.50},"VideoSeal":{"regen":0.50,"rinse":0.50}}
 F={"VINE":{"bit_acc":{a:PA[a]["vine"] for a in PA}},"TrustMark":{"bit_acc":{a:PA[a]["tm"] for a in PA}},"VideoSeal":{"bit_acc":{a:PA[a]["vs"] for a in PA}}}
@@ -96,7 +105,7 @@ UNMK_CAP_VINE=37.0
 # penalties, latency) are kept; only the numbers change, so the rest of the solver is untouched.
 # Per-cell image-to-image std for the live gate now comes from ba_sd_profile.json (BA_SD_COL).
 import json as _bjson, os as _bos
-_BLP = "/data/tailor/workspace/wm_dataset10k/topk_capacity_output_20260910/inputs/baseline_table.json"
+_BLP = _bos.path.join(_BUNDLED, "baseline_table.json")
 BASELINE_PROVENANCE = None
 if _bos.path.exists(_BLP):
     _BT = _bjson.load(open(_BLP)); _C = _BT["cells"]
@@ -382,8 +391,7 @@ DEFAULT_STD_DIFFUSION = 0.08
 # An identity request (min_bits > 0) takes the identity floor; a presence request interpolates in its
 # threshold between the two levels. Measured 2026-09-03 on the N=100 fitting slice:
 CLEAN_FLOOR_DEFAULT = {"VINE": (0.14, 0.30), "TrustMark": (0.55, 0.70), "VideoSeal": (0.50, 0.625)}
-CLEAN_FLOOR_JSON = _bos.environ.get("CLEAN_MIN_JSON",
-                                    "/data/tailor/workspace/wm_dataset10k/topk_capacity_output_20260910/inputs/clean_minimum_strength.json")
+CLEAN_FLOOR_JSON = _bos.environ.get("CLEAN_MIN_JSON", _bos.path.join(_BUNDLED, "clean_minimum_strength.json"))
 _CLEAN_IDENTITY_BA, _CLEAN_Z99, _CLEAN_PRESENCE_TAU = 0.83, 2.326, 0.63
 def clean_floor_levels(path=None):
     """{fragment: (presence_floor, identity_floor)} from the clean sweep, or the baked defaults."""
@@ -433,8 +441,7 @@ DEFAULT_MARGIN = 0.02
 # because the stage changes the embed and with it the spread.
 BA_SD_COL = {}
 try:
-    _sdp = _bos.environ.get("BA_SD_PROFILE",
-                            "/data/tailor/workspace/wm_dataset10k/topk_capacity_output_20260910/inputs/ba_sd_profile.json")
+    _sdp = _bos.environ.get("BA_SD_PROFILE", _bos.path.join(_BUNDLED, "ba_sd_profile.json"))
     if _bos.path.exists(_sdp):
         for _k, _v in _bjson.load(open(_sdp)).items():
             BA_SD_COL[_k] = float(_v.get("sd", 0.0))
