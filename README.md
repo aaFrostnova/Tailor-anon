@@ -1,58 +1,95 @@
-# Cryptographic composite watermark with an SMT solver
+# TAILOR: request-conditioned watermark composition
 
-A keyed, error-corrected watermark carried by three fragments (VINE, TrustMark, VideoSeal), and a z3
-solver that turns a deployment's request (attacks to survive, false-positive budget, fidelity floor, latency
-budget, payload) into the configuration that meets it at the best fidelity, or proves that none does. The
-solver reads a measured offline table of the fragments' behaviour, certifies every configuration it returns
-on held-out images, and defers adversarial columns to live measurement.
+Code accompanying the submission. Given a deployment request
+`u = (attacks, FPR budget, PSNR floor, latency ceiling)`, TAILOR selects and
+certifies a composition of watermark fragments that satisfies all four.
 
 ## Layout
 
-| path | contents |
-|---|---|
-| `scripts/defense/watermark_smt_v2.py` | the solver (fragments, continuous strengths, embed order, front-end stages, capacity from bit accuracy, per-image floor, budget-split thresholds, live gate) |
-| `scripts/defense/surrogate_model.py` | the offline table the solver reads (piecewise-linear curves, per-image block, live offsets) |
-| `scripts/defense/live_calibration.py` | the live loop: solve, measure, patch the table, re-solve |
-| `scripts/defense/eval_matrix.py`, `scripts/defense/composite_external_eval.py` | the deployed composite: keyed codeword, per-fragment and fused verification, presence tests, geometric cascade; baseline wrappers |
-| `src/` | fragments, BCH and soft decoding, fusion, front-end stages, attacks, the image pool |
-| `scripts/attack/` | CtrlRegen+ and UnMarker in their own environments |
-| `scripts/pipeline/` | the campaign, evaluation and orchestration scripts (table building, request sampling, class solves, certification, live loop, analyses); see its README |
-| `data/` | the measured table, the feasibility matrix and the live gate's variance profile |
-| `tests/` | the solver's behavioural tests (`PYTHONPATH=.:scripts/defense python -m pytest tests/`) |
-| `docs/` | design notes and plans |
-| `CODE_MAP.md`, `PIPELINE_REPORT_CN.md`, `WATERMARK_SMT_README.md` | module map, pipeline report, solver notes |
+```
+solver/        SMT model, request protocol, and the live-calibration loop
+measurement/   unified detector, FPR accounting, and the measurement harness
+fragments/     watermark fragments, attacks, image pool, and soft decoding
+paper/         exporters that build the tables and figures from frozen results
+inputs/        frozen offline measurements the solver reads
+```
 
-## Setup
+### solver/
+
+| File | Role |
+|---|---|
+| `watermark_smt_v2.py` | the SMT encoding: coverage, FPR threshold, PSNR floor as an MSE ceiling, latency, and the optimization loop |
+| `capacity_protocol.py` | the four-input request, per-image acceptance, and the candidate walk |
+| `surrogate_model.py` | piecewise-linear response curves, the live offset, and request-scoped refinement |
+| `live_topk_full.py` | live calibration: measure, compare, patch the request-local model, re-solve |
+| `live_calibration.py` | the discrepancy measurement a failed candidate produces |
+| `certify_full_frozen.py` | certification of a configuration against a frozen measurement set |
+| `watermark_smt_topk.py` | enumeration of further candidates by blocking returned structures |
+| `campaign.py`, `controller.py`, `prepare.py`, `prefetch.py`, `local_gpu.py` | campaign orchestration |
+| `eval_matrix.py`, `composite_external_eval.py`, `solver_eval_continuous.py` | evaluation entry points |
+
+### measurement/
+
+`unified_detector.py` holds the verification rule every method is scored by:
+the per-configuration threshold from the requested FPR budget, the union bound
+over verification paths, and the aligned readouts. `final_measurement.py` runs
+the frozen campaign; `rigor_protocol.py` and `final_holdout.py` enforce the
+digest checks that keep the offline and live image slices disjoint. The three
+`test_*.py` files check the detector, the selection adapter, and campaign
+startup.
+
+### fragments/
+
+The watermark fragments (`vine_crypto_wrapper.py`, `trustmark_fragment.py`,
+`videoseal_fragment.py`), the geometric stages (`syncseal_frontend.py`,
+`tiled_trustmark.py`, `angle_probe.py`), the attack suite (`attacks.py`), the
+image pool with its per-source offsets (`image_pool.py`), and soft decoding
+(`soft_fusion.py`, `soft_bch.py`, `shortened_bch.py`).
+
+Several modules here are alternatives that the evaluation measured and did not
+deploy (`phasemark.py`, `quant_qim_modules.py`, `dft_kred_modules.py`,
+`fusion_head3.py`, `maskwm_wrapper.py`); they are kept because the reported
+ablations refer to them.
+
+## Paths
+
+Every path is a placeholder rooted at `/data/tailor`. Set the three environment
+variables in `paths.py` to your own locations:
 
 ```bash
-conda env create -f environment.yaml        # the fingerprint environment (torch, z3-solver, diffusers, ...)
-conda activate fingerprint
-# fragment models and front-ends: VINE, TrustMark, VideoSeal, SyncSeal checkouts under external/ (see CODE_MAP.md)
-export HF_TOKEN=...                          # for the gated model downloads
-bash scripts/attack/setup_ctrlregen.sh       # optional: the two cross-environment attacks
-bash scripts/attack/setup_unmarker.sh
+export TAILOR_PROJECT=/your/project
+export TAILOR_WORKSPACE=/your/workspace
+export TAILOR_ASSETS=/your/model/checkpoints
 ```
 
-## Using the solver
+## Frozen inputs
 
-```python
-import sys; sys.path[:0] = [".", "scripts/defense"]
-import json, watermark_smt_v2 as W
-from surrogate_model import Surrogate
-sg = Surrogate.from_dict(json.load(open("data/surrogate_canonical.json")))
-scen = dict(min_psnr=36.0, max_ms=4000.0, attacks=["jpeg25", "blur", "regen", "rot9"],
-            min_ba=W.beta_from_fpr(1e-4), allow_resync=True, allow_nested=True, min_bits=37, resolution=512)
-built, model, rounds, certified = W.solve_exact_model(scen, enable_order=True, continuous_strength=True, surrogate=sg)
-# built is None  ->  UNSAT (no configuration meets the request)
-```
+`inputs/` carries the offline measurements the solver reads, so the selection
+stage runs without re-running the measurement campaign:
 
-`scripts/pipeline/solver_eval_continuous.py` (`solve_free`) wraps this call and returns the configuration
-(fragments, embed order, strengths, front-end stages, delivered PSNR); `scripts/defense/live_calibration.py`
-(`solve_with_live`) adds the live measurement loop.
+| File | Contents |
+|---|---|
+| `surrogate_canonical.json` | the piecewise-linear response curves over fragment strength |
+| `baseline_table.json` | per fragment, attack and strength: bit accuracy, distortion, latency |
+| `clean_minimum_strength.json` | clean-image strength floors per fragment |
+| `ba_sd_profile.json` | per-cell image-to-image standard deviation |
+| `prior_width.json` | the prior width used to shrink a live offset |
+| `request_feasibility_matrix.json` | precomputed feasibility per request class |
+| `C1.json` ... `C5.json` | the evaluated request sets, one per scenario |
 
-## Reproducing the evaluation
+Not included, because of size: the per-image measurement cells (about 800 MB),
+the image pool, and the fragment and attack model checkpoints. The cells are
+reproduced by `measurement/final_measurement.py`; the checkpoints come from the
+upstream watermark and diffusion projects listed in `requirements.txt`.
 
-`scripts/pipeline/README.md` walks through the four stages: building the offline table, sampling and
-solving the five request classes, certifying every returned configuration on held-out images in domain
-and out of domain, and the live loop. All scripts take their locations from `WM_REPO`, `WM_SCRATCH`,
-`WM_PY` and related variables; the defaults are the paths of the reported runs.
+## Reproducing the reported numbers
+
+1. Install `requirements.txt` and the upstream watermark packages.
+2. Point the three roots at your copies.
+3. Selection only, from the frozen inputs:
+   `python solver/watermark_smt_topk.py --help`
+4. Live calibration on your own images, which re-measures every candidate:
+   `python solver/live_topk_full.py --help`
+5. Tables and figures from frozen results: the `paper/export_*.py` and
+   `paper/plot_*.py` scripts each read one committed result file and write one
+   LaTeX table or figure.

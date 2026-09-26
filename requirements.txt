@@ -1,12 +1,19 @@
-numpy>=1.24.0
-Pillow>=10.0.0
-torch>=2.0.0
-torchvision>=0.15.0
-pytorch-msssim>=1.0.0
-lpips>=0.1.4
-PyWavelets>=1.4.0
-scipy>=1.10.0
-cryptography>=41.0.0
-pyyaml>=6.0
-tqdm>=4.65.0
-scikit-image>=0.21.0
+# Solver and protocol
+z3-solver>=4.12
+numpy>=1.24
+scipy>=1.10
+
+# Measurement and fragments
+torch>=2.1
+torchvision>=0.16
+pillow>=10.0
+scikit-image>=0.22
+bchlib>=2.0
+
+# Watermark fragments (install from the upstream projects; see README)
+#   trustmark
+#   videoseal
+#   vine  (VINE-R checkpoints)
+# Attack models
+#   diffusers>=0.27      regeneration and editing attacks
+#   compressai           neural-compression attacks

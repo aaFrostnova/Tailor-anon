@@ -1,29 +1,4 @@
-results/
-images/
-fingerprinted/
-slurm_logs/
 __pycache__/
 *.pyc
-.pytest_cache/
-*.key
-.agent-config/
-agent-config.local.yaml
-/AGENTS.md
-/CLAUDE.md
-/agents/codex.md
-todo/*
-!todo/README.md
-# agent/session state and local artefacts (2026-09-08)
-.claude/
-.superpowers/
-.agent-style/
-logs/
-figures/
-external/
-envs/
-ckpts/
-docs/archive/
-6a3af1ee773478ddf7390bb9/
-source/Weekly Report.*
-scripts/pipeline/__pycache__/
-tests/.pytest_cache/
+*.egg-info/
+.ipynb_checkpoints/
