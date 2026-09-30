@@ -216,8 +216,24 @@ The rest of `inputs/`:
 | `ba_sd_profile.json` | per-cell image-to-image standard deviation |
 | `prior_width.json` | the prior width used to shrink a live offset |
 | `request_feasibility_matrix.json` | precomputed feasibility per request class |
-| `C1.json` ... `C5.json` | the evaluated request sets, one per scenario |
+| `requests.json` | the 7,321 requests the evaluation reports, 1,551 / 1,532 / 1,373 / 822 / 2,043 over S1 to S5 |
+| `C1.json` ... `C5.json` | the per-class request sets the campaign reads, 2,000 each |
 | `smt_inputs*.json` | the solo, composite and end-to-end measurements the SMT model reads at import |
+
+### The evaluated requests
+
+`inputs/requests.json` is the set the paper reports on. Each entry is the four
+inputs and nothing else:
+
+```json
+{"id": 0, "scenario": "S1",
+ "attacks": ["blur", "bright", "contrast", "crop_jpeg", "hflip", "jpeg25", "noise"],
+ "fpr": 7.275957614183426e-12, "min_psnr": 34.0, "max_ms": 2000.0}
+```
+
+All 7,321 are distinct in those four inputs, and they name 20 attacks between
+them. The file also carries the per-scenario and per-attack counts, so a run can
+be checked against the set it was meant to cover before any result is compared.
 
 **Not included.** The image pool, the fragment and attack model checkpoints, and
 the 30,333 live-calibration cells, about 800 MB. Those cells are a different
