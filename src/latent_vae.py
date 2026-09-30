@@ -1,6 +1,6 @@
 """Shared SD-VAE latent helper for post-hoc latent-frequency watermarks.
 
-Any latent-domain post-hoc watermark (PhaseMark-style phase modulation, ZoDiac-style
+Any latent-domain post-hoc watermark (phase modulation, ZoDiac-style
 Fourier ring, etc.) needs to (a) VAE-encode an arbitrary image to the SD latent, modify
 it, and (b) VAE-decode back to a watermarked image, then (c) re-encode a suspect image to
 read the latent. This wraps a frozen SD AutoencoderKL with that contract.
