@@ -182,13 +182,31 @@ and live slices disjoint.
 
 ## What is included, and what is not
 
-`inputs/` ships the frozen outputs of stages 2 to 4, so stages 5 and 6 run
-without repeating the measurement campaign:
+**The offline performance database is included in full.** It is the output of
+stages 1 to 3, it is what the solver reads, and it is why the quickstart runs
+with nothing else. `inputs/surrogate_canonical.json` (4.5 MB) holds it:
+
+| Entry | Count | What it is |
+|---|---|---|
+| `base` | 60 | recovery of each fragment under each attack, as a curve over strength: 3 fragments by 20 attacks |
+| `delta` | 120 | interference: the recovery a fragment loses when another is written after it, per ordered pair and attack |
+| `frontend` | 827 | the replacement curves for the four geometric stages |
+| `perimage` | 181 | the per-image scores behind those means, with the keyed verification flag |
+| `d`, `e` | 3, 3 | solo embedding distortion, and the excess when two fragments share an image |
+| `latency` | 67 | embedding and decoding time, per fragment and per stage |
+| `cap` | 42 | payload capacity per fragment and attack |
+| `additivity`, `additivity_multi` | 11, 6 | the audit of how close composition is to additive in distortion |
+
+The per-image records alone are **199,690 measurements**: for example
+`TrustMark|blur` carries 11 strength knots by 100 images. The provenance is in
+the file: 100 images drawn 25/25/25/15/10 from the five pool sources, measured
+2026-09-01.
+
+The rest of `inputs/`:
 
 | File | Contents |
 |---|---|
-| `surrogate_canonical.json` | the piecewise-linear response curves over fragment strength |
-| `baseline_table.json` | per fragment, attack and strength: bit accuracy, distortion, latency |
+| `baseline_table.json` | the per cell table the live loop compares against |
 | `clean_minimum_strength.json` | clean-image strength floors per fragment |
 | `ba_sd_profile.json` | per-cell image-to-image standard deviation |
 | `prior_width.json` | the prior width used to shrink a live offset |
@@ -196,9 +214,13 @@ without repeating the measurement campaign:
 | `C1.json` ... `C5.json` | the evaluated request sets, one per scenario |
 | `smt_inputs*.json` | the solo, composite and end-to-end measurements the SMT model reads at import |
 
-Not included, because of size: the image pool, the 30,333 measurement cells
-(about 800 MB), and the fragment and attack model checkpoints. Stages 1, 2 and 5
-regenerate the first two; the checkpoints come from the upstream projects.
+**Not included.** The image pool, the fragment and attack model checkpoints, and
+the 30,333 live-calibration cells, about 800 MB. Those cells are a different
+artifact from the offline database above: each one records a candidate
+configuration measured on the user images for one attack during stage 5, so they
+belong to a selection run rather than to the library. Stage 5 regenerates them
+and reuses whatever is already on disk; stage 1 rebuilds the pool; the
+checkpoints come from the upstream projects.
 
 ## A note on the fragment library
 
