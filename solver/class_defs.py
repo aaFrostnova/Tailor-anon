@@ -8,7 +8,9 @@ SIG = ["jpeg25", "blur", "noise", "bright", "contrast"]
 # classes measure the method rather than the fragments' known limits (user 2026-09-07).
 # FEAS_MATRIX=<path> selects another matrix file (the v1 matrix the 2026-09-08 C1-C4 shards were drawn from is
 # kept as request_feasibility_matrix.v1_20260908.json; the default is the current, payload-aware one).
-_FEAS = json.load(open(os.environ.get("FEAS_MATRIX") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "request_feasibility_matrix.json")))
+_BUNDLED = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "inputs")
+_FEAS_PATH = os.environ.get("FEAS_MATRIX") or os.path.join(_BUNDLED, "request_feasibility_matrix.json")
+_FEAS = json.load(open(_FEAS_PATH))
 NEEDS_2ND = set(_FEAS["needs_second_fragment"])          # columns VINE cannot carry: a second fragment, k = 2
 # Sampler version. v3 (2026-09-08): after the fidelity floor is drawn against the presence line, it is capped by
 # what the payload's capacity line costs (matrix need_cap; the capacity clause holds the carrier to
