@@ -9,6 +9,44 @@ exporters that write the reported tables. The measurement artifacts themselves
 are too large to distribute, so every stage that produces one is included and
 documented below.
 
+## Quickstart
+
+The solver runs from a fresh clone. No GPU, no model checkpoints, and no
+configuration: the offline measurements it reads are in `inputs/`.
+
+```bash
+pip install z3-solver numpy scipy
+python solver/watermark_smt_v2.py --attacks jpeg25 --min_psnr 42 --max_ms 100
+```
+
+```
+QUERY custom: PSNR>=42.0 ms<=100.0 ba>=0.9 bits>=0 ['jpeg25']
+  VINE(alpha=0.3)   PSNR~45.6dB . 57ms
+```
+
+One fragment at low strength answers a compression-only request. Ask for more
+and the composition grows:
+
+```bash
+python solver/watermark_smt_v2.py --attacks jpeg25 crop75 regen --min_psnr 38 --max_ms 500
+```
+
+```
+QUERY custom: PSNR>=38.0 ms<=500.0 ba>=0.9 bits>=0 ['jpeg25', 'crop75', 'regen']
+  VINE(alpha=0.7) + TrustMark   PSNR~38.3dB . 70ms
+```
+
+Ask for something the library cannot deliver and the answer is a statement about
+the library, not a failed search:
+
+```bash
+python solver/watermark_smt_v2.py --attacks jpeg25 crop75 crop50 rot9 regen rinse --min_psnr 46 --max_ms 200
+```
+
+```
+  UNSAT - no combination satisfies these conditions
+```
+
 ## Layout
 
 ```
@@ -29,9 +67,18 @@ export TAILOR_WORKSPACE=/your/workspace    # campaigns, cells, artifacts
 export TAILOR_ASSETS=/your/checkpoints     # diffusion, VAE and watermark weights
 ```
 
-Every path in the code is a placeholder rooted at `/data/tailor` and resolved
-through `paths.py`. The three watermark fragments and the attack models come
-from their upstream projects; `requirements.txt` lists them.
+`TAILOR_PROJECT` is read by the solver; `CLEAN_MIN_JSON` and `BA_SD_PROFILE`
+override two frozen inputs. Every other path in the measurement scripts is a
+placeholder rooted at `/data/tailor` that you edit to your own location. The
+watermark fragments and the attack models come from their upstream projects,
+which `requirements.txt` lists.
+
+**What runs without the measurement artifacts.** 32 of the 52 modules under
+`solver/`, `measurement/` and `pipeline/` import with no data and no GPU, which
+covers the solver, the request protocol, the response model and the detector.
+The other 20 are campaign scripts: they read the artifacts a run produces, or
+they need the watermark packages, so they raise rather than run until you point
+them at your own campaign.
 
 ## The pipeline
 
@@ -159,3 +206,9 @@ regenerate the first two; the checkpoints come from the upstream projects.
 (`phasemark.py`, `quant_qim_modules.py`, `dft_kred_modules.py`,
 `fusion_head3.py`, `maskwm_wrapper.py`). They are kept because the reported
 ablations refer to them.
+
+## License
+
+MIT, see `LICENSE`. The watermark fragments and the attack models are used
+through their upstream packages and are not redistributed here; their own
+licenses govern those packages.
