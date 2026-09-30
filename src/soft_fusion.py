@@ -57,7 +57,7 @@ def qim_margin_to_llr(mag: np.ndarray, delta: float, scale: float = 1.0) -> np.n
     margin (distance to the bit-0 lattice minus distance to the bit-1 lattice)
     is positive when the carrier sits closer to the bit-1 lattice, i.e. evidence
     for bit 1. This mirrors the distance-to-nearest-of-two-lattices decode rule
-    used in src.quant_qim_modules / scripts.prototype_dft_kredundant.
+    used by the fragment wrappers when they expose raw logits.
     """
     mag = np.asarray(mag, dtype=np.float64)
     # nearest bit-0 lattice point: round(mag/delta)*delta

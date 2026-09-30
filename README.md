@@ -133,9 +133,14 @@ as a continuous variable while staying inside linear real arithmetic.
 
 ### Stage 4. Requests
 
+`solver/class_defs.py` holds the five threat classes and their request sampler.
+Sampling is deterministic per class, and the order of the draws inside
+`sample_class` is the request's identity, so it must not be reordered. The
+sampled sets the campaign reads are `inputs/C1.json` to `inputs/C5.json`.
+
 ```bash
-python pipeline/class_scenarios.py             # five threat classes -> inputs/C1..C5.json
-python pipeline/make_request_feasibility_v2.py # -> inputs/request_feasibility_matrix.json
+python pipeline/make_request_feasibility_v2.py  # -> inputs/request_feasibility_matrix.json
+python pipeline/class_scenarios.py              # per-class solver-level evaluation
 ```
 
 ### Stage 5. Selection and live calibration
@@ -221,13 +226,6 @@ configuration measured on the user images for one attack during stage 5, so they
 belong to a selection run rather than to the library. Stage 5 regenerates them
 and reuses whatever is already on disk; stage 1 rebuilds the pool; the
 checkpoints come from the upstream projects.
-
-## A note on the fragment library
-
-`src/` also holds alternatives the evaluation measured and did not deploy
-(`phasemark.py`, `quant_qim_modules.py`, `dft_kred_modules.py`,
-`fusion_head3.py`, `maskwm_wrapper.py`). They are kept because the reported
-ablations refer to them.
 
 ## License
 

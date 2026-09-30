@@ -7,7 +7,7 @@ into the fingerprint interpreter. Pattern (3 processes):
   3. (fingerprint) --mode decode : decode attacked_dir/ with meta.json -> detection report
 
 Detection = fused-BCH-verify OR fused-zerobit(>=tau) OR TrustMark, matching
-benchmark_composite_defense.py. Supports --fragments for ablations (e.g. no PhaseMark).
+benchmark_composite_defense.py. Supports --fragments for ablations.
 """
 import argparse, glob, json, os, sys
 import numpy as np, torch
@@ -22,21 +22,16 @@ from src.trustmark_fragment import TrustMarkFragment
 from src.videoseal_fragment import VideoSealFragment
 from src.soft_fusion import method_soft_to_codeword_llr, fuse_llrs, llr_to_bits
 from src.soft_bch import decode_and_verify
-# The rejected fragments (PhaseMark, MaskWM, DFT/QIM) and the retired learned head are only reachable from this
-# file's own command-line evaluation; the deployed cascade imports this module for scale_resid /
-# nested_vine_embed / rot and must not depend on them, so they are imported where they are used.
-def _legacy():
-    from src.phasemark import PhaseMarkWrapper
+# MaskWM is an external baseline, not part of the deployed cascade, which imports this module only
+# for scale_resid / nested_vine_embed / rot; it is therefore imported where it is used.
+def _maskwm():
     from src.maskwm_wrapper import MaskWMWrapper
-    from src.learned_fragment_methods import DFTKredMethod, QuantQIMMethod
-    from src.fusion_head3 import load_head3, head3_llr
-    return PhaseMarkWrapper, MaskWMWrapper, DFTKredMethod, QuantQIMMethod, load_head3, head3_llr
+    return MaskWMWrapper
 from src.syncseal_frontend import load_sync, sync_embed, sync_rectify, DEFAULT_JIT
 from src.payload import image_id_to_payload
 
 KEY = b"v5_key_encoder_master"
-SPEC = {"phasemark": ("logit", "raw_scores", "target"), "vine": ("prob", "raw_probs", "target"),
-        "dft": ("logit", "raw_logits", "id_tx"), "qim": ("logit", "raw_logits", "id_tx"),
+SPEC = {"vine": ("prob", "raw_probs", "target"),
         "trustmark": ("logit", "raw_logits", "target"),
         "videoseal": ("logit", "raw_logits", "target"),   # geometry fragment (rotation/crop-robust; replaces trustmark)
         "maskwm": ("prob", "raw_scores", "target")}       # MaskWM-D baseline (mask-adaptive pixel wm)
@@ -44,13 +39,10 @@ SPEC = {"phasemark": ("logit", "raw_scores", "target"), "vine": ("prob", "raw_pr
 
 def build(fragments, dev, sb, tm_variant="B"):
     b = {
-        "phasemark": lambda: _legacy()[0](master_key=KEY, method_name="phasemark", n_bits=sb.n, vae_key="sd21", device=dev),
         "vine":      lambda: VineCryptoWrapper(master_key=KEY, method_name="vine", n_bits=sb.n, device=dev),
-        "dft":       lambda: _legacy()[2](os.path.join(REPO, "results/dft_fftaware_baseline/ckpt.pt"), KEY, "dft_kred", dev),
-        "qim":       lambda: _legacy()[3](os.path.join(REPO, "results/quant_qim_frozen_d006/ckpt.pt"), KEY, "quant_qim", dev),
         "trustmark": lambda: TrustMarkFragment(master_key=KEY, method_name="trustmark", n_bits=sb.n, model_type=tm_variant, device=dev),
         "videoseal": lambda: VideoSealFragment(master_key=KEY, method_name="videoseal", n_bits=sb.n, device=dev),
-        "maskwm":    lambda: _legacy()[1](ckpt_path=os.path.join(REPO, "external/MaskWM/checkpoints/D_128bits.pth"),
+        "maskwm":    lambda: _maskwm()(ckpt_path=os.path.join(REPO, "external/MaskWM/checkpoints/D_128bits.pth"),
                                            master_key=KEY, method_name="maskwm", n_bits=sb.n, device=dev),
     }
     return {n: b[n]() for n in fragments}
@@ -119,7 +111,6 @@ def main():
                          "detection still 1.0 incl regen (validated for vine+trustmark, n=16). "
                          "0.50 = +5.5dB with minor regen dip. See strength_tradeoff_eval.py.")
     ap.add_argument("--output", default="results/defense/composite_external.json")
-    ap.add_argument("--no_head3", action="store_true", help="disable the learned 3-way gated fusion head (default ON for vine+trustmark+videoseal)")
     ap.add_argument("--no_bestpath", action="store_true", help="disable best-of-paths detection (per-fragment crypto-verify OR fused)")
     ap.add_argument("--resync", action="store_true", help="rotation-resync fallback: when @0deg detection fails, "
                     "search candidate angles and accept iff ANY fragment crypto-verifies (2^-37 zero false-accept, "
@@ -160,15 +151,10 @@ def main():
                     "bit-acc stays below this, the loss is INFORMATION (crop/regen) not misalignment -> skip the fine "
                     "search (no angle can cross the crypto floor). Separates recoverable rotation (coarse best >>gate) "
                     "from info-loss (coarse best ~0.50).")
-    ap.add_argument("--head3_ckpt", default=os.path.join(REPO, "results/defense/frag3_head.pt"))
     args = ap.parse_args()
     dev = "cuda"
     sb = ShortenedBCH(); tau = float(binom.ppf(0.99, sb.n, 0.5) + 1) / sb.n
     frag = build(args.fragments, dev, sb, args.tm_variant)
-    # learned 3-way gated fusion head: default ON for the VINE+TM+VideoSeal composite
-    HEAD3_FRAGS = ["vine", "trustmark", "videoseal"]
-    use_head3 = (not args.no_head3 and args.fragments == HEAD3_FRAGS and os.path.exists(args.head3_ckpt))
-    head3 = _legacy()[4](args.head3_ckpt, dev) if use_head3 else None
     use_bestpath = not args.no_bestpath
     sync = load_sync(args.syncseal_jit, dev) if (args.syncseal or args.geo_cascade) else None
     # add the standalone TrustMark OR-tier only when neither pixel geometry fragment is fused
@@ -279,11 +265,8 @@ def main():
             kind, getter, _ = SPEC[name]
             m = frag[name]; perm, M = m.get_perm_M(image_id)
             al[name] = method_soft_to_codeword_llr(getattr(m, getter)(att), perm, M, kind=kind, n_codeword=sb.n)
-        # primary fused codeword: learned 3-way gated head when available, else equal-MRC
-        if use_head3:
-            fused = _legacy()[5](head3, al["vine"], al["trustmark"], al["videoseal"], dev)
-        else:
-            fused = fuse_llrs(al, weights=None, n_codeword=sb.n)
+        # primary fused codeword: equal-MRC, the position-wise sum of the aligned log-likelihoods
+        fused = fuse_llrs(al, weights=None, n_codeword=sb.n)
         fba = float(np.mean(llr_to_bits(fused) == tx))
         fver = float(decode_and_verify(fused, image_id, codec=sb)["detected"])
         fzb = 1.0 if fba >= tau else 0.0

@@ -1,6 +1,6 @@
 """Per-class solver-level evaluation: five threat classes, 2,000 sampled requests each.
 
-The classes are the deployment personas of persona_scenarios_v2.py (C1 signal, C2 +geometry, C3 +AI
+The classes are the five deployment scenarios (C1 signal, C2 +geometry, C3 +AI
 regeneration, C4 +adversarial removal, C5 broad+identity). A class fixes the attacks a deployment must
 survive; a request within the class samples what the deployment can afford: the false-positive
 budget (which sets the bit-accuracy target), the fidelity floor, the latency budget, the payload, and
